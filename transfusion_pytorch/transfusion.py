@@ -499,6 +499,8 @@ def naive_attn_mask(
     device = None
 ) -> Bool['b i j']:
 
+    # The .unbind(dim=-1) function splits the tensor along the last dimension and returns its slices.
+    # Since modalities is of shape (b, m, 3), unbind(dim=-1) gives three tensors: modality_type, offsets, and length (all shape (b, m))
     _, offsets, length = modalities.unbind(dim = -1)
 
     seq = torch.arange(seq_len, device = device)

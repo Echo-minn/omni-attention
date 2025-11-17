@@ -1,278 +1,73 @@
-<img src="./transfusion.png" width="400px"></img>
+# **Fine-grained FlashAttention with interleaved masking for Cross-Modal Data Training Efficiency**
 
-## Transfusion - Pytorch
+> Mira Xiao(minxiao@andrew.cmu.edu)
+>
+> GuanWei Wu(guanweiwu@andrew.cmu.edu)
 
-Pytorch implementation of [Transfusion](https://www.arxiv.org/abs/2408.11039), "Predict the Next Token and Diffuse Images with One Multi-Modal Model", from MetaAI.
+I'm thinking about a way to support interleaved masking technique in FlashAttention to accerlate models training on arbitrary interleavings of text and images. They are engineering/research intensive and promsing.
 
-In this repo, we will substitute diffusion with flow matching given the success of Flux from Black Forest Labs (but will keep the original paper title given Transflow does not have the same ring). This repository will also attempt to extend to any number of modalities.
+## Background and Motivation
 
-## Install
+The well-known Transformer language models are auto-regressive and tokens only attend previous ones, so we apply causal mask to hide future tokens behind current step in standard attention.
+Large multimodal models increasingly train on **interleaved text and image sequences**, enabling natural conversational interfaces that combine language with visual understanding and generation. Current attention mechanisms, however, struggle with the **heterogeneous structure** of such data. Text requires **causal masking** (to preserve autoregressive behavior), while images often benefit from **non-causal or intra-block full attention** to capture spatial coherence. Naively combining these modalities leads to inefficient kernels, excessive memory use, and degraded training throughput.
 
-```bash
-$ pip install transfusion-pytorch
-```
+<img src="./imgs/causal_mask.png" alt="Causal Mask: Text-only Attention" width="380" height="350" style="display: block; margin: 0 auto" />
 
-## Usage
+<img src="./imgs/interleaved_mask.png" alt="Interleaved Mask: Fine-Grained Cross-Modal Masking" width="450" height="400" style="display: block; margin: 0 auto" />
 
-One modality, say images
+**FlashAttention** has emerged as a breakthrough in training efficiency by reordering attention computation to minimize memory I/O, but it is primarily optimized for homogeneous masks (causal or full). Extending FlashAttention to handle **fine-grained interleaved masking** could unlock significant efficiency gains for multimodal training at scale.
 
-```python
-from torch import randint, randn
-from transfusion_pytorch import Transfusion
+## Project Objectives
 
-model = Transfusion(
-    num_text_tokens = 256,
-    dim_latent = 384,
-    modality_default_shape = (4,),  # fallback, in the case the language model did not produce a valid modality shape
-    transformer = dict(
-        dim = 512,
-        depth = 8
-    )
-)
+This project proposes to design and evaluate **Fine-grained FlashAttention with Interleaved Masking**, focusing on:
 
-# any torch.long is text, torch.float is modalities
+1. **Mask generalization**: Support text–image interleaving with different masking rules (causal text, full intra-image, controlled cross-modal).
+2. **Tile-aware optimization**: Align FlashAttention tiles with modality boundaries to reduce irregular per-element masks.
+3. **Kernel optimization**: Write custom high-performance kernels for the interleaved masking.
+4. **Evaluation**: Benchmark against standard FlashAttention/FlexAttention and dense attention on multimodal pretraining workloads.
 
-text_and_images = [
-    [randint(0, 256, (16,)), randn(4, 384), randint(0, 256, (8,)), randn(6, 384)],
-    [randint(0, 256, (16,)), randn(7, 384), randint(0, 256, (5,)), randn(2, 384), randint(0, 256, (9,))]
-]
+## Anticipated Challenges
 
-loss = model(text_and_images)
+1. **Irregular masking overhead**: Interleaved data produce heterogeneous masks that reduce GPU warp efficiency if handled naively.
+2. **Tile misalignment**: Tiles overlapping modality boundaries may require per-element masking, undermining FlashAttention’s efficiency.
+3. **Sequence length**: Discretized images greatly increase sequence length, stressing memory bandwidth despite IO-aware design.
+4. **Cross-modal balance**: Different loss types (cross-entropy for text, reconstruction for images) may complicate optimization and gradient stability.
 
-loss.backward()
+## Project Goals Milestones
 
-# after much training
+Baseline: Naive version attention variant with intervleaved masking
 
-one_multimodal_sample = model.sample()
-```
+Target: FlashAttention with causal mask
 
-Multiple different modalities
+- 50%: 50% performance from the baseline to the target
+- 75%: 70%
+- 100%: 85%
+- 125%: 90%
+- 150%: 90%+
 
-```python
-from torch import randint, randn
-from transfusion_pytorch import Transfusion
+## How to achieve the objectives
 
-model = Transfusion(
-    num_text_tokens = 256,
-    dim_latent = (384, 192),                 # specify multiple latent dimensions
-    modality_default_shape = ((4,), (2,)),   # default shapes for first and second modality
-    transformer = dict(
-        dim = 512,
-        depth = 8
-    )
-)
+Stack: Python/PyTorch for model part, C++/CUDA for kernel part; PYBIND11 for binding the kernel to Python.
 
-# then for the Tensors of type float, you can pass a tuple[int, Tensor] and specify the modality index in the first position
+1. Apply the interleaved masking technique in FlashAttention.
+2. Align FlashAttention tiles with modality boundaries to reduce irregular per-element masks.
+3. Optimize the kernel for the interleaved masking(tile alignment, precomputed mask metadata, hybrid causal/full kernels, vectorization, synchronization, etc.).
+4. Benchmark against standard FlashAttention/FlexAttention and dense attention on multimodal pretraining workloads.
 
-# any torch.long is text, torch.float is modalities
+## Dataset preparation
 
-text_images_and_audio = [
-    [randint(0, 256, (16,)), (0, randn(4, 384)), randint(0, 256, (8,)), (1, randn(6, 192))],
-    [randint(0, 256, (16,)), randn(7, 384), randint(0, 256, (5,)), (1, randn(2, 192)), randint(0, 256, (9,))]
-]
+1. Construct text/image interleaved sequences with some tags in between.
+2. Multimodal training dataset(subset of the pre-training dataset)
 
-loss = model(text_images_and_audio)
+## Expected Contributions
 
-loss.backward()
+* A novel high-performance attention variant supporting **fine-grained interleaved masks**.
+* Implementation strategies (tile alignment, precomputed mask metadata, hybrid causal/full kernels).
+* Empirical benchmarks on multimodal datasets demonstrating improved **training throughput, memory use, and stability**.
 
-# after much training
+## References
 
-one_multimodal_sample = model.sample()
-```
-
-Automatically taking care of encoding and decoding of images
-
-```python
-import torch
-from torch import nn, randint, randn
-from transfusion_pytorch import Transfusion, print_modality_sample
-
-mock_encoder = nn.Conv2d(3, 384, 3, padding = 1)
-mock_decoder = nn.Conv2d(384, 3, 3, padding = 1)
-
-model = Transfusion(
-    num_text_tokens = 12,
-    dim_latent = 384,
-    channel_first_latent = True,
-    modality_default_shape = (4, 4),
-    modality_encoder = mock_encoder,
-    modality_decoder = mock_decoder,
-    transformer = dict(
-        dim = 512,
-        depth = 8
-    )
-)
-
-text_and_images = [
-    [
-        randint(0, 12, (16,)),  # 16 text tokens
-        randn(3, 8, 8),         # (8 x 8) 3 channeled image
-        randint(0, 12, (8,)),   # 8 text tokens
-        randn(3, 7, 7)          # (7 x 7) 3 channeled image
-    ],
-    [
-        randint(0, 12, (16,)),  # 16 text tokens
-        randn(3, 8, 5),         # (8 x 5) 3 channeled image
-        randint(0, 12, (5,)),   # 5 text tokens
-        randn(3, 2, 16),        # (2 x 16) 3 channeled image
-        randint(0, 12, (9,))    # 9 text tokens
-    ]
-]
-
-loss = model(text_and_images)
-
-loss.backward()
-
-# after much training
-
-one_multimodal_sample = model.sample()
-
-print_modality_sample(one_multimodal_sample)
-```
-
-To pretrain on language first, just pass in your text as type `Int['batch seq']`
-
-```python
-import torch
-from transfusion_pytorch import Transfusion
-
-model = Transfusion(
-    num_text_tokens = 256,
-    dim_latent = 384,
-    transformer = dict(
-        dim = 512,
-        depth = 8,
-    )
-).cuda()
-
-text = torch.randint(0, 256, (2, 1024)).cuda()
-
-loss = model(text)
-loss.backward()
-
-# after much training
-
-sampled = model.generate_text_only(text[:, :1], 1024)
-```
-
-## Examples
-
-To run any of the examples `train_{example_name}.py` in the project root, simply install dependencies first as so
-
-```bash
-$ pip install .[examples]
-```
-
-If you run into some weird error with `safetensors`, run this too
-
-```bash
-$ pip install -U diffusers transformers accelerate scipy ftfy safetensors
-```
-
-## Citations
-
-```bibtex
-@inproceedings{Zhou2024TransfusionPT,
-    title  = {Transfusion: Predict the Next Token and Diffuse Images with One Multi-Modal Model},
-    author = {Chunting Zhou and Lili Yu and Arun Babu and Kushal Tirumala and Michihiro Yasunaga and Leonid Shamis and Jacob Kahn and Xuezhe Ma and Luke Zettlemoyer and Omer Levy},
-    year   = {2024},
-    url    = {https://api.semanticscholar.org/CorpusID:271909855}
-}
-```
-
-```bibtex
-@misc{Rubin2024,
-    author  = {Ohad Rubin},
-    url     = {https://medium.com/@ohadrubin/exploring-weight-decay-in-layer-normalization-challenges-and-a-reparameterization-solution-ad4d12c24950}
-}
-```
-
-```bibtex
-@article{Nguyen2024MinPS,
-    title   = {Min P Sampling: Balancing Creativity and Coherence at High Temperature},
-    author  = {Minh Nguyen and Andrew Baker and Andreas Kirsch and Clement Neo},
-    journal = {ArXiv},
-    year    = {2024},
-    volume  = {abs/2407.01082},
-    url     = {https://api.semanticscholar.org/CorpusID:270870613}
-}
-```
-
-```bibtex
-@article{Bao2022AllAW,
-    title   = {All are Worth Words: A ViT Backbone for Diffusion Models},
-    author  = {Fan Bao and Shen Nie and Kaiwen Xue and Yue Cao and Chongxuan Li and Hang Su and Jun Zhu},
-    journal = {2023 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-    year    = {2022},
-    pages   = {22669-22679},
-    url     = {https://api.semanticscholar.org/CorpusID:253581703}
-}
-```
-
-```bibtex
-@inproceedings{Zhao2024MonoFormerOT,
-    title     = {MonoFormer: One Transformer for Both Diffusion and Autoregression},
-    author    = {Chuyang Zhao and Yuxing Song and Wenhao Wang and Haocheng Feng and Errui Ding and Yifan Sun and Xinyan Xiao and Jingdong Wang},
-    year      = {2024},
-    url       = {https://api.semanticscholar.org/CorpusID:272832492}
-}
-```
-
-```bibtex
-@article{Yang2024ConsistencyFM,
-    title   = {Consistency Flow Matching: Defining Straight Flows with Velocity Consistency},
-    author  = {Ling Yang and Zixiang Zhang and Zhilong Zhang and Xingchao Liu and Minkai Xu and Wentao Zhang and Chenlin Meng and Stefano Ermon and Bin Cui},
-    journal = {ArXiv},
-    year    = {2024},
-    volume  = {abs/2407.02398},
-    url     = {https://api.semanticscholar.org/CorpusID:270878436}
-}
-```
-
-```bibtex
-@inproceedings{Zhou2024ValueRL,
-    title   = {Value Residual Learning For Alleviating Attention Concentration In Transformers},
-    author  = {Zhanchao Zhou and Tianyi Wu and Zhiyun Jiang and Zhenzhong Lan},
-    year    = {2024},
-    url     = {https://api.semanticscholar.org/CorpusID:273532030}
-}
-```
-
-```bibtex
-@inproceedings{Duvvuri2024LASERAW,
-    title   = {LASER: Attention with Exponential Transformation},
-    author  = {Sai Surya Duvvuri and Inderjit S. Dhillon},
-    year    = {2024},
-    url     = {https://api.semanticscholar.org/CorpusID:273849947}
-}
-```
-
-```bibtex
-@inproceedings{Dong2024HymbaAH,
-    title   = {Hymba: A Hybrid-head Architecture for Small Language Models},
-    author  = {Xin Dong and Y. Fu and Shizhe Diao and Wonmin Byeon and Zijia Chen and Ameya Mahabaleshwarkar and Shih-Yang Liu and Matthijs Van Keirsbilck and Min-Hung Chen and Yoshi Suhara and Yingyan Lin and Jan Kautz and Pavlo Molchanov},
-    year    = {2024},
-    url     = {https://api.semanticscholar.org/CorpusID:274166163}
-```
-
-```bibtex
-@article{Zhu2024HyperConnections,
-    title   = {Hyper-Connections},
-    author  = {Defa Zhu and Hongzhi Huang and Zihao Huang and Yutao Zeng and Yunyao Mao and Banggu Wu and Qiyang Min and Xun Zhou},
-    journal = {ArXiv},
-    year    = {2024},
-    volume  = {abs/2409.19606},
-    url     = {https://api.semanticscholar.org/CorpusID:272987528}
-}
-```
-
-```bibtex
-@article{Zhu2025FracConnectionsFE,
-    title   = {Frac-Connections: Fractional Extension of Hyper-Connections},
-    author  = {Defa Zhu and Hongzhi Huang and Jundong Zhou and Zihao Huang and Yutao Zeng and Banggu Wu and Qiyang Min and Xun Zhou},
-    journal = {ArXiv},
-    year    = {2025},
-    volume  = {abs/2503.14125},
-    url     = {https://api.semanticscholar.org/CorpusID:277104144}
-}
-```
+[1] [Transfusion: Predict the Next Token and Diffuse Images with One Multi-Modal Model](http://arxiv.org/abs/2408.11039)\
+[2] [Flex Attention: a Programming Model for Generating  Optimized Attention Kernels](https://arxiv.org/pdf/2412.05496)\
+[3] [Blog: FlexAttention - The Flexibility of PyTorch with the Performance of FlashAttention](https://pytorch.org/blog/flexattention/)\
+[4] [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/pdf/2205.14135)
