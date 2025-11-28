@@ -84,6 +84,7 @@ def get_build_sources():
     build_sources.append("./mma/basic/flash_attn_mma_split_kv.cu")
     build_sources.append("./mma/basic/flash_attn_mma_split_q.cu")
     build_sources.append("./mma/basic/flash_attn_mma_share_kv.cu")
+    build_sources.append("./mma/basic/omni_attn_mma_share_kv.cu")
     build_sources.append("./mma/basic/flash_attn_mma_share_qkv.cu")
     build_sources.append("./mma/basic/flash_attn_mma_tiling_qk.cu")
     build_sources.append("./mma/basic/flash_attn_mma_tiling_qkv.cu")
@@ -180,18 +181,18 @@ def get_build_cuda_cflags(build_pkg: bool = False):
     extra_cuda_cflags.append(
         "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
     )
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/utils")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/mma")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/mma/basic")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/mma/swizzle")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/mma/others")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/cutlass")
-    extra_cuda_cflags.append(f"-I {project_dir}/kernels/flash-attn/pybind")
-    extra_cuda_cflags.append(f"-I {project_dir}/third-party/cutlass/include")
-    extra_cuda_cflags.append(
-        f"-I {project_dir}/third-party/cutlass/tools/util/include"
-    )
+    # Point include paths to the actual omni-attn source tree
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/utils")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma/basic")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma/swizzle")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma/others")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/cutlass")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/pybind")
+    # If CUTLASS is installed separately, uncomment and set the proper include paths below:
+    # extra_cuda_cflags.append(f"-I {project_dir}/third-party/cutlass/include")
+    # extra_cuda_cflags.append(f"-I {project_dir}/third-party/cutlass/tools/util/include")
     return extra_cuda_cflags
 
 
@@ -652,6 +653,70 @@ for B, H, N, D in BHNDs:
         k,
         v,
         "mma(split-q+share-kv+stage2)",
+        o,
+        stages=2,
+    )
+    
+    # Omni-Attention MMA with sparse blocks (full attention pattern)
+    # Create block mask for full attention (all blocks are FULL type)
+    # The kernel uses Br and Bc which depend on headdim and stage
+    # For simplicity, use fixed block sizes that match common configurations
+    import math
+    # Br and Bc are typically 64 or 128 depending on headdim
+    # For headdim 64: Br=64, Bc=64 (stage 1) or Br=64, Bc=32 (stage 2)
+    # For headdim 128: Br=128, Bc=64 (stage 1) or Br=128, Bc=32 (stage 2)
+    # Use Br=64, Bc=64 as default (matches stage 1 for headdim 64)
+    BLOCK_M = 64  # Br tile size
+    BLOCK_N = 64  # Bc tile size
+    num_q_blocks = (args.N + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (args.N + BLOCK_N - 1) // BLOCK_N
+    
+    # Create full attention pattern (all blocks are FULL = 2)
+    block_mask_pattern = torch.full(
+        (num_q_blocks, num_kv_blocks), 2, dtype=torch.int32, device=q.device
+    )
+    
+    # Create kv_num_blocks, kv_indices, block_mask_types
+    kv_num_blocks = torch.full(
+        (args.B, args.H, num_q_blocks), num_kv_blocks, dtype=torch.int32, device=q.device
+    )
+    kv_indices = torch.zeros(
+        (args.B, args.H, num_q_blocks, num_kv_blocks), dtype=torch.int32, device=q.device
+    )
+    block_mask_types = torch.zeros(
+        (args.B, args.H, num_q_blocks, num_kv_blocks), dtype=torch.int32, device=q.device
+    )
+    
+    # Fill in indices and types
+    for q_idx in range(num_q_blocks):
+        for kv_idx in range(num_kv_blocks):
+            for b in range(args.B):
+                for h in range(args.H):
+                    kv_indices[b, h, q_idx, kv_idx] = kv_idx
+                    block_mask_types[b, h, q_idx, kv_idx] = 2  # FULL
+    
+    # Benchmark omni-attn-mma kernel
+    def omni_attn_benchmark_func(q, k, v, o, stages):
+        lib.omni_attn_mma_stages_split_q_shared_kv(
+            q, k, v, o, kv_num_blocks, kv_indices, block_mask_types, stages
+        )
+        return o
+    
+    out_omni_mma_share_kv1, _ = run_benchmark(
+        lambda q, k, v, o, s: omni_attn_benchmark_func(q, k, v, o, 1),
+        q,
+        k,
+        v,
+        "omni-mma(split-q+share-kv+stage1)",
+        o,
+        stages=1,
+    )
+    out_omni_mma_share_kv2, _ = run_benchmark(
+        lambda q, k, v, o, s: omni_attn_benchmark_func(q, k, v, o, 2),
+        q,
+        k,
+        v,
+        "omni-mma(split-q+share-kv+stage2)",
         o,
         stages=2,
     )

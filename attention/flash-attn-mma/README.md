@@ -130,8 +130,8 @@ Currently, for small-scale attention (B<=4, H <=48, SeqLen <= 8192), the flash-a
 cd kernels/flash-attn
 # Volta, Ampere, Ada, Hopper, ...
 python3 -m pip install flash-attn --no-build-isolation
-export TORCH_CUDA_ARCH_LIST=Ada # for Ada only
-export TORCH_CUDA_ARCH_LIST=Ampere # for Ampere only
+export TORCH_CUDA_ARCH_LIST=8.9 # for Ada (RTX 4090, etc.)
+export TORCH_CUDA_ARCH_LIST=8.0 # for Ampere (RTX 3080, A100, etc.) - use 8.0 for older Ampere
 python3 flash_attn_mma.py --D 64 # test all default settings for D=64
 ```
 

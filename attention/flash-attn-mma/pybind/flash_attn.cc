@@ -170,6 +170,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   TORCH_BINDING_COMMON_EXTENSION(flash_attn_mma_stages_split_kv)
   TORCH_BINDING_COMMON_EXTENSION(flash_attn_mma_stages_split_q)
   TORCH_BINDING_COMMON_EXTENSION(flash_attn_mma_stages_split_q_shared_kv)
+  TORCH_BINDING_COMMON_EXTENSION(omni_attn_mma_stages_split_q_shared_kv)
   TORCH_BINDING_COMMON_EXTENSION(flash_attn_mma_stages_split_q_shared_qkv)
   TORCH_BINDING_COMMON_EXTENSION(flash_attn_mma_stages_split_q_tiling_qk)
   TORCH_BINDING_COMMON_EXTENSION(flash_attn_mma_stages_split_q_tiling_qkv)
