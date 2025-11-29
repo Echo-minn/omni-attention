@@ -1,48 +1,5 @@
 #include "utils.h"
 
-// Write FlashAttention-2 from scratch using Tensor Cores with MMA PTX
-// instruction. The input is Q,K,V, 4D tensor with shape [batch_size, num_heads,
-// seq_len, head_dim]. The output is O, a 4D tensor with shape [batch_size,
-// num_heads, seq_len, head_dim].
-
-// The FlashAttention-2 algorithm is described in the following paper:
-// https://arxiv.org/pdf/2307.08691
-
-// Q,K,V,O: [batch_size, num_heads, seq_len, head_dim], [B,H,N,d]
-// each block processes Q_tile with shape [Br,d] and full K,V with shape [N,d]
-
-// Split Q across MMA(Warps) and keep access KV for all MMA(Warps),
-// in order to reduce the comm between warps via smem and warp shuffle.
-
-// MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps
-// |   64x64   |      warp_KV 0       |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
-
-// MMA = m16n8k16, Br=16x8=128, Bc=8x16=128, layout: 8 warps
-// |  128x128  |      warp_KV 0        |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x16) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x16) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x16) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x16) |
-// | warp_QP 4 | MMA 4 ... MMA 4 (x16) |
-// | warp_QP 5 | MMA 5 ... MMA 5 (x16) |
-// | warp_QP 6 | MMA 6 ... MMA 6 (x16) |
-// | warp_QP 7 | MMA 7 ... MMA 7 (x16) |
-
-// MMA = m16n8k16, Br=16x8=128, Bc=8x8=64, layout: 8 warps
-// |  128x64  |      warp_KV 0        |
-// | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
-// | warp_QP 1 | MMA 1 ... MMA 1 (x8) |
-// | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
-// | warp_QP 3 | MMA 3 ... MMA 3 (x8) |
-// | warp_QP 4 | MMA 4 ... MMA 4 (x8) |
-// | warp_QP 5 | MMA 5 ... MMA 5 (x8) |
-// | warp_QP 6 | MMA 6 ... MMA 6 (x8) |
-// | warp_QP 7 | MMA 7 ... MMA 7 (x8) |
-
 template <
     const int kHeadDim,          // Headdim, 32,64,128
     const int kMmaAtomM,         // MMA Atom M, 16
@@ -108,24 +65,16 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
   const int lane_id = tid % WARP_SIZE;            // 0~31
   const int warp_QP = warp_id;                    // 0,1,2,3 or 0~7
   const int warp_KV = 0;                          // 0
-  // MMA Layout [Br,Bc]=[64,64], MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout: 4 warps 
-  // |   64x64   |      warp_KV 0       | 
-  // | warp_QP 0 | MMA 0 ... MMA 0 (x8) |
-  // | warp_QP 1 | MMA 1 ... MMA 1 (x8) | 
-  // | warp_QP 2 | MMA 2 ... MMA 2 (x8) |
-  // | warp_QP 3 | MMA 3 ... MMA 3 (x8) | 
-  // MMA Layout [Br,Bc]=[128,128],
-
-  // MMA = m16n8k16, Br=16x8=128, Bc=8x16=128, layout: 8 warps 
-  // |  128x128  | warp_KV 0             | 
-  // | warp_QP 0 | MMA 0 ... MMA 0 (x16) | 
-  // | warp_QP 1 | MMA 1 ... MMA 1 (x16) | 
-  // | warp_QP 2 | MMA 2 ... MMA 2 (x16) | 
-  // | warp_QP 3 | MMA 3 ... MMA 3 (x16) | 
-  // | warp_QP 4 | MMA 4 ... MMA 4 (x16) | 
-  // | warp_QP 5 | MMA 5 ... MMA 5 (x16) | 
-  // | warp_QP 6 | MMA 6 ... MMA 6 (x16) | 
-  // | warp_QP 7 | MMA 7 ... MMA 7 (x16) |
+  // MMA Layout [Br,Bc]=[64,64], MMA = m16n8k16, Br=16x4=64, Bc=8x8=64, layout:
+  // 4 warps |   64x64   |      warp_KV 0       | | warp_QP 0 | MMA 0 ... MMA 0
+  // (x8) | | warp_QP 1 | MMA 1 ... MMA 1 (x8) | | warp_QP 2 | MMA 2 ... MMA 2
+  // (x8) | | warp_QP 3 | MMA 3 ... MMA 3 (x8) | MMA Layout [Br,Bc]=[128,128],
+  // MMA = m16n8k16, Br=16x8=128, Bc=8x16=128, layout: 8 warps |  128x128  |
+  // warp_KV 0        | | warp_QP 0 | MMA 0 ... MMA 0 (x16) | | warp_QP 1 | MMA
+  // 1 ... MMA 1 (x16) | | warp_QP 2 | MMA 2 ... MMA 2 (x16) | | warp_QP 3 | MMA
+  // 3 ... MMA 3 (x16) | | warp_QP 4 | MMA 4 ... MMA 4 (x16) | | warp_QP 5 | MMA
+  // 5 ... MMA 5 (x16) | | warp_QP 6 | MMA 6 ... MMA 6 (x16) | | warp_QP 7 | MMA
+  // 7 ... MMA 7 (x16) |
   const int Q_gmem_offset =
       ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
        (QKV_head_id * QKV_seqlen * kHeadDim)); // Q [seqlen,d]
@@ -211,7 +160,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
   uint32_t R_Q[kNumPrefetchQs2r][kWarpTileSeqLenQ][4]; // [4/8/1][1][4]
   uint32_t R_K[kWarpTileSeqLenK][2];                   // [8][2]
   uint32_t R_V[kWarpTileHeadDimV][2];                  // [8][2]
-  // registers for current tile_K_seqlen within, [64,64] = S_tile[Br,Bc] = Q_tile[Br,d] * K[Bc,d], each thread hold 2x32 bits regs.
+  // registers for current tile_K_seqlen within, [64,64] = S_tile[Br,Bc]
+  // = Q_tile[Br,d] * K[Bc,d], each thread hold 2x32 bits regs.
   uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][2]; // [1][8][2]
   // registers for tile_K_seqlen O=PV[Br,d]=P@V, [2][2/4][2], 8 or 16 regs.
   uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][2]; // [1][8][2]
@@ -261,7 +211,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
              (kPrefetchKg2sSmemId * K_tile_size +
               load_smem_K_Bc * (kHeadDim + kPadK) + load_smem_K_d) *
                  sizeof(half));
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
           CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
         }
@@ -284,7 +234,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
              (kPrefetchVg2sSmemId * V_tile_size +
               load_smem_V_Bc * (kHeadDim + kPadV) + load_smem_V_d) *
                  sizeof(half));
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
           CP_ASYNC_CG(load_smem_V_ptr + i * 2, &V[load_gmem_V_addr + i], 16);
         }
@@ -302,7 +252,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
            (kPrefetchKg2sSmemId * K_tile_size +
             load_smem_K_Bc * (kHeadDim + kPadK) + load_smem_K_d) *
                sizeof(half));
-      #pragma unroll
+#pragma unroll
       for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
         CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
       }
@@ -324,9 +274,9 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         }
         __syncthreads();
 
-        #pragma unroll
+#pragma unroll
         for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-          #pragma unroll
+#pragma unroll
           for (int i = 0; i < kWarpTileSeqLenQ; ++i) { // Q[Br,d]=[M,K]
             int warp_smem_Q_Br =
                 warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
@@ -352,13 +302,13 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     // S_tile[Br,Bc]=Q_tile[Br,d]@K[Bc,d]
     // <HGEMM in shared memory>
     fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
-    #pragma unroll
+#pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       // smem -> reg, load m16k16 smem Q, offset d according tile_K_d.
       // ldmatrix.x4 for Q_tile_smem.
       if constexpr (!kCanPrefetchQs2r) {
-        // load Q from smem -> regs in each loop w/o prefetch Q s2r.
-        #pragma unroll
+// load Q from smem -> regs in each loop w/o prefetch Q s2r.
+#pragma unroll
         for (int i = 0; i < kWarpTileSeqLenQ; ++i) { // Q[Br,d]=[M,K]
           int warp_smem_Q_Br =
               warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
@@ -371,8 +321,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
           LDMATRIX_X4(R_Q[0][i][0], R_Q[0][i][1], R_Q[0][i][2], R_Q[0][i][3],
                       lane_smem_Q_ptr); // now, R_Q[1][1][4]
         } // end for kWarpTileSeqLenQ
-      } 
-      else { // kCanPrefetchQs2r = true
+      } else { // kCanPrefetchQs2r = true
         // Lazy Prefetch Q g2s: In order not to block the calculation of MMA,
         // we choose to delay Prefetch Q s2r until this time.
         if constexpr (kDelayPrefetchQs2r) {
@@ -386,8 +335,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
               }
               __syncthreads();
             } // end if tile_K_d == 0
-            // Now, load tile_K_d Q from smem -> regs in each loop w/o prefetch Q s2r.
-            #pragma unroll
+// Now, load tile_K_d Q from smem -> regs in each loop w/o prefetch Q s2r.
+#pragma unroll
             for (int i = 0; i < kWarpTileSeqLenQ; ++i) { // Q[Br,d]=[M,K]
               int warp_smem_Q_Br =
                   warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
@@ -406,9 +355,9 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         } // end kDelayPrefetchQs2r
       } // end kCanPrefetchQs2r
 
-      // smem -> reg, load k16n8 from smem K, offset d according tile_K_d.
-      // ldmatrix.x2 for K_tile_smem, [Bc,kMmaAtomK] from [Bc,d]=[K,N]
-      #pragma unroll
+// smem -> reg, load k16n8 from smem K, offset d according tile_K_d.
+// ldmatrix.x2 for K_tile_smem, [Bc,kMmaAtomK] from [Bc,d]=[K,N]
+#pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
         // load k16n8 via ldmatrix.x2 from K_tile_smem[Bc,d].
         // K[Bc,d] with row major means K^T[d,Bc] in col major.
@@ -429,7 +378,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         // MMA compute
         static_assert(kWarpTileSeqLenQ == 1);
         { // kWarpTileSeqLenQ = 1
-          #pragma unroll
+#pragma unroll
           for (int j = 0; j < kWarpTileSeqLenK; ++j) {
             HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[tile_K_d][0][0],
                       R_Q[tile_K_d][0][1], R_Q[tile_K_d][0][2],
@@ -441,7 +390,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         // MMA compute
         static_assert(kWarpTileSeqLenQ == 1);
         { // kWarpTileSeqLenQ = 1
-          #pragma unroll
+#pragma unroll
           for (int j = 0; j < kWarpTileSeqLenK; ++j) {
             HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[0][0][0], R_Q[0][0][1],
                       R_Q[0][0][2], R_Q[0][0][3], R_K[j][0], R_K[j][1],
@@ -466,7 +415,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
            (kPrefetchVg2sSmemId * V_tile_size +
             load_smem_V_Bc * (kHeadDim + kPadV) + load_smem_V_d) *
                sizeof(half));
-      #pragma unroll
+#pragma unroll
       for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
         CP_ASYNC_CG(load_smem_V_ptr + i * 2, &V[load_gmem_V_addr + i], 16);
       }
@@ -487,7 +436,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
              (kPrefetchKg2sSmemId * K_tile_size +
               load_smem_K_Bc * (kHeadDim + kPadK) + load_smem_K_d) *
                  sizeof(half));
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
           CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
         }
@@ -511,8 +460,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     static_assert(kWarpTileSeqLenQ == 1);
     // Row max for [Br,Bc] tile, Thread -> Warp -> Block.
     { // kWarpTileSeqLenQ = 1
-      // Thread level reduce max across kWarpTileSeqLenK dim, namely Bc.
-      #pragma unroll
+// Thread level reduce max across kWarpTileSeqLenK dim, namely Bc.
+#pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
         // reference:
         // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
@@ -562,7 +511,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
       block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
 
-      #pragma unroll
+#pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
         half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
@@ -634,10 +583,10 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
 
     // <HGEMM in registers>
     fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 2>(R_O, 0);
-    #pragma unroll
+#pragma unroll
     for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
-      // Load k16n8 V from smem -> regs, R_KV, ldmatrix.x2.trans.
-      #pragma unroll
+// Load k16n8 V from smem -> regs, R_KV, ldmatrix.x2.trans.
+#pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
         int warp_smem_V_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) +
                             j * kMmaAtomN; // d, matmaul N
@@ -667,7 +616,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       int w = tile_V_Bc * 2; // MMA(Warp) selected, 0, 2, 4, 6
       static_assert(kWarpTileSeqLenP == 1);
       { // kWarpTileSeqLenP = 1
-        #pragma unroll
+#pragma unroll
         for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
           HMMA16816(R_O[0][j][0], R_O[0][j][1], R_S[0][w][0], R_S[0][w][1],
                     R_S[0][w + 1][0], R_S[0][w + 1][1], R_V[j][0], R_V[j][1],
@@ -704,9 +653,9 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
           __expf(block_row_max_old_0 - block_row_max_new_0);
       float rescale_o_factor_1 =
           __expf(block_row_max_old_1 - block_row_max_new_1);
-      // 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new, m_old.
-      // m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V
-      #pragma unroll
+// 0. Rescale O: Online rescaling O each tile_K_seqlen step, need m_new, m_old.
+// m = max(m_old, m_new), O_new[Br,d] = exp(m_old - m) * O_old + P@V
+#pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
         // Note that the formula in the FA2 paper is incorrect; here,
         // the inverse of the exp function should not be taken, as it
@@ -777,7 +726,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
   { // kWarpTileSeqLenP = 1
     float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0][0]);
     float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[0][1]);
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8, 16, 32, ...
       // Scaling in registers & convert F32 -> half for O collective store.
       if constexpr (kOStorageAccFloat32) {
@@ -805,7 +754,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
   // with reg reuse & warp shuffle. may need R_Z[2][4].
   static_assert(kWarpTileSeqLenP == 1);
   { // kWarpTileSeqLenP = 1
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8
       if constexpr (kCanPrefetchQs2r && kNumPrefetchQs2r > 1) {
         // reuse R_Q[4/8][1][4] for collective store.
@@ -964,6 +913,12 @@ void launch_flash_attn_mma_stages_split_q_shared_kv(torch::Tensor Q,
                                        QKV_seqlen, QKV_head);
 }
 
+// The `stages` parameter here refers to how many pipeline stages are used for shared memory tiling of K/V blocks.
+// - If `stages == 1`, all K/V tiles for the given Q block are loaded and used immediately (no pipelining).
+// - If `stages > 1`, multiple stages are used to enable prefetching K/V tiles while the previous tile is being computed, overlapping compute and memory access for higher efficiency on modern GPUs.
+//
+// In practice, `stages` allows tuning between memory usage and compute/memory overlap. For example, `stages = 2` means double-buffering: while computing with one shared memory tile, the next tile is being loaded in parallel.
+
 void flash_attn_mma_stages_split_q_shared_kv(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor V, torch::Tensor O,
                                              int stages) {
@@ -1014,3 +969,225 @@ void flash_attn_mma_stages_split_q_shared_kv(torch::Tensor Q, torch::Tensor K,
     }
   }
 }
+
+void omni_attn_mma_blockmask(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
+    torch::Tensor block_mask_types, int stages) {
+  // ---------------------------------------------------------------------------
+  // Host-side wrapper for a future "FlashAttention + block mask" MMA kernel.
+  //
+  // 这里负责做 shape/stride 准备，你可以在后面按 head_dim/stages 调用
+  // 自己实现的 omni_attn_mma_blockmask_kernel。
+  // ---------------------------------------------------------------------------
+  CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf) // Q [B,H,N,D]
+  CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf) // K [B,H,N,D]
+  CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf) // V [B,H,N,D]
+  CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf) // O [B,H,N,D]
+
+  const int d = Q.size(3); // head_dim
+
+  const int batch  = Q.size(0);
+  const int heads  = Q.size(1);
+  const int seqlen = Q.size(2);
+
+  const int num_q_blocks = kv_num_blocks.size(2);
+  const int max_blocks   = kv_indices.size(3);
+
+  // Strides for block mask tensors: [B, H, num_q_blocks, max_blocks]
+  const int kv_nb_s0 = kv_num_blocks.stride(0);
+  const int kv_nb_s1 = kv_num_blocks.stride(1);
+  const int kv_nb_s2 = kv_num_blocks.stride(2);
+
+  const int kv_idx_s0 = kv_indices.stride(0);
+  const int kv_idx_s1 = kv_indices.stride(1);
+  const int kv_idx_s2 = kv_indices.stride(2);
+  const int kv_idx_s3 = kv_indices.stride(3);
+
+  const int mask_s0 = block_mask_types.stride(0);
+  const int mask_s1 = block_mask_types.stride(1);
+  const int mask_s2 = block_mask_types.stride(2);
+  const int mask_s3 = block_mask_types.stride(3);
+
+  // ---------------------------------------------------------------------------
+  // 下面是你后面要写的 CUDA kernel 启动代码（示意）：
+  //
+  // 1. 写一个模板 kernel，例如：
+  //
+  template <const int kHeadDim, const int kStage>
+  __global__ void omni_attn_mma_blockmask_kernel(
+      half *Q, half *K, half *V, half *O,
+      const int *kv_num_blocks, const int *kv_indices,
+      const int *block_mask_types,
+      int seqlen, int heads, int batch,
+      int num_q_blocks, int max_blocks,
+      int kv_nb_s0, int kv_nb_s1, int kv_nb_s2,
+      int kv_idx_s0, int kv_idx_s1, int kv_idx_s2, int kv_idx_s3,
+      int mask_s0, int mask_s1, int mask_s2, int mask_s3);
+
+template <const int kHeadDim, const int kStage>
+launch_omni_attn_mma_blockmask<kHeadDim,kStage>(Q, K, V, O,
+    kv_num_blocks, kv_indices, block_mask_types,
+    seqlen, heads, batch,
+    num_q_blocks, max_blocks,
+    kv_nb_s0, kv_nb_s1, kv_nb_s2,
+    kv_idx_s0, kv_idx_s1, kv_idx_s2, kv_idx_s3,
+    mask_s0, mask_s1, mask_s2, mask_s3);
+  // 2. 再写一个 launch_omni_attn_mma_blockmask<kHeadDim,kStage>(...)，
+  //    仿照上面的 launch_flash_attn_mma_stages_split_q_shared_kv：
+  //
+  //   - 选择 Br, Bc, kNumThreads, smem_size
+  //   - grid 形状可以设为：
+  //       grid.x = num_q_blocks;
+  //       grid.y = batch * heads;
+  //     这样每个 CTA 对应一个 (b, h, q_block)。
+  //
+  //   - block.x = kNumThreads （和 FA2 一样）
+  //
+  // 3. 在这里根据 d 和 stages 调用对应的模板实例，比如：
+  //
+  //   switch (d) {
+  //     case 64:
+  //       launch_omni_attn_mma_blockmask<64, 2>(
+  //           Q, K, V, O,
+  //           kv_num_blocks, kv_indices, block_mask_types,
+  //           seqlen, heads, batch,
+  //           num_q_blocks, max_blocks,
+  //           kv_nb_s0, kv_nb_s1, kv_nb_s2,
+  //           kv_idx_s0, kv_idx_s1, kv_idx_s2, kv_idx_s3,
+  //           mask_s0, mask_s1, mask_s2, mask_s3);
+  //       break;
+  //     case 128:
+  //       ...
+  //   }
+  //
+  // 你可以先只支持 d=64，stages=2，把 full mask 的行为对齐 simple kernel，
+  // 再一点点加上 causal / vlm / random_sparse。
+  // ---------------------------------------------------------------------------
+
+  (void)batch;
+  (void)heads;
+  (void)seqlen;
+  (void)num_q_blocks;
+  (void)max_blocks;
+  (void)kv_nb_s0;
+  (void)kv_nb_s1;
+  (void)kv_nb_s2;
+  (void)kv_idx_s0;
+  (void)kv_idx_s1;
+  (void)kv_idx_s2;
+  (void)kv_idx_s3;
+  (void)mask_s0;
+  (void)mask_s1;
+  (void)mask_s2;
+  (void)mask_s3;
+  (void)stages;
+  (void)d;
+
+  // ---------------------------------------------------------------------------
+  // Device 侧 block mask 两层循环的伪代码（放在 kernel 里）：
+  //
+  // 假设 kernel 里已经有：
+  //
+  //   int batch_id = blockIdx.y / heads;
+  //   int head_id  = blockIdx.y % heads;
+  //   int q_block  = blockIdx.x;   // [0, num_q_blocks)
+  //
+  //   int BLOCK_SIZE = Br;         // 理想情况 BLOCK_SIZE == Br == 128
+  //
+  //   int q_start = q_block * BLOCK_SIZE;
+  //   int q_end   = min(q_start + BLOCK_SIZE, seqlen);
+  //
+  //   int num_kv = kv_num_blocks[
+  //       batch_id * kv_nb_s0 +
+  //       head_id  * kv_nb_s1 +
+  //       q_block  * kv_nb_s2];
+  //
+  //   // 外层：遍历当前 (b,h,q_block) 的所有 active KV blocks
+  //   for (int kv_idx = 0; kv_idx < num_kv; ++kv_idx) {
+  //     int indices_off =
+  //         batch_id * kv_idx_s0 +
+  //         head_id  * kv_idx_s1 +
+  //         q_block  * kv_idx_s2 +
+  //         kv_idx   * kv_idx_s3;
+  //
+  //     int kv_block = kv_indices[indices_off];  // 0..num_kv_blocks-1
+  //
+  //     int mask_type = block_mask_types[
+  //         batch_id * mask_s0 +
+  //         head_id  * mask_s1 +
+  //         q_block  * mask_s2 +
+  //         kv_idx   * mask_s3];
+  //
+  //     if (mask_type == BLOCK_MASK_MASKED) {
+  //       // 完全跳过这个 block：不 load K/V，不做 QK^T / PV
+  //       continue;
+  //     }
+  //
+  //     // 一个 kv_block 对应 BLOCK_SIZE 个 K/V token。
+  //     // 如果 FlashAttention 的 Bc=64, BLOCK_SIZE=128，则:
+  //     //   tiles_per_block = BLOCK_SIZE / Bc = 2
+  //     int tiles_per_block = BLOCK_SIZE / Bc;
+  //
+  //     int first_tile = kv_block * tiles_per_block;
+  //     int last_tile  = first_tile + tiles_per_block;   // [first, last)
+  //
+  //     // 内层：在当前 KV-block 内，按 FlashAttention 原来的 tile_K_seqlen 维度循环
+  //     for (int tile_K_seqlen = first_tile;
+  //          tile_K_seqlen < last_tile; ++tile_K_seqlen) {
+  //       // 这里可以直接拷贝 flash_attn_mma_stages_split_q_shared_kv_kernel
+  //       // 里 for (tile_K_seqlen ...) 循环体的主体部分：
+  //       //
+  //       //   - K/V 的 gmem->smem 加载 (根据 tile_K_seqlen)
+  //       //   - QK^T -> R_S
+  //       //   - （在 R_S 上加 causal mask: q_abs, kv_abs）
+  //       //   - 在线 softmax（行 max / exp / sum）
+  //       //   - P@V -> R_O
+  //       //   - 更新 O 的累加器 + running m,l
+  //     }
+  //   }
+  //
+  // 你可以先只实现 FULL 情况（mask_type==FULL），
+  // 在 kernel 里跳过 CAUSAL/MASKED，然后用 --compare full 做对拍，
+  // 确认 dense 行为一致，再逐步加 CAUSAL / VLM / random_sparse。
+  // ---------------------------------------------------------------------------
+}
+
+// causal mask
+// [1,0,0,0,0,0,0,0,
+// 1,1,0,0,0,0,0,0,
+// 1,1,1,0,0,0,0,0,
+// 1,1,1,1,0,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,1,0,0,
+// 1,1,1,1,1,1,1,0,
+// 1,1,1,1,1,1,1,1]
+
+// full mask
+// [1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1]
+
+// vlm mask
+// [1,0,0,0,0,0,0,0,
+// 1,1,0,0,0,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1,
+// 1,1,1,1,1,1,1,1]
+// or
+// [1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,0,0,0,
+// 1,1,1,1,1,1,0,0,
+// 1,1,1,1,1,1,1,0,
+// 1,1,1,1,1,1,1,1]

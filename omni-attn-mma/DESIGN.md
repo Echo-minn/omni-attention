@@ -127,3 +127,52 @@ kv_num_blocks, kv_indices, block_mask_types = create_omni_block_mask(
 4. **Multi-query attention**: Support MQA/GQA
 5. **Autotuning**: Add Triton autotune for optimal block sizes
 
+
+## Test
+
+```python
+import torch
+from torch import nn, randint, randn
+
+B H N D = 2 2 1024 64
+
+# modality example, same format as transfusion
+text_and_images_example = [
+    [
+        randint(0, 12, (16,)),  # 16 text tokens
+        randn(3, 8, 8),         # (8 x 8) 3 channeled image
+        randint(0, 12, (8,)),   # 8 text tokens
+        randn(3, 7, 7)          # (7 x 7) 3 channeled image
+    ],
+    [
+        randint(0, 12, (16,)),  # 16 text tokens
+        randn(3, 8, 5),         # (8 x 5) 3 channeled image
+        randint(0, 12, (5,)),   # 5 text tokens
+        randn(3, 2, 16),        # (2 x 16) 3 channeled image
+        randint(0, 12, (19,))    # 19 text tokens
+    ]
+]
+
+[text_and_images, random_modality_positions] = generate_random_input(B, H, N, D, text_and_images_example)
+
+# padding to max length
+x = get_modality_embeddings(text_and_images)
+
+W_Q = randn(H, D, D)
+W_K = randn(H, D, D)
+W_V = randn(H, D, D)
+
+Q = W_Q @ x
+K = W_K @ x
+V = W_V @ x
+
+modalities = get_modalities(text_and_images)
+
+block_mask = create_omni_block_mask(modalities, B, H, N, N, BLOCK_SIZE=128)
+
+output = omni_attention(Q, K, V, block_mask)
+
+flex_output = flex_attention(Q, K, V, block_mask)
+
+# compare output
+```

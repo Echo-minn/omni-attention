@@ -1,560 +1,565 @@
 #include "utils.h"
 
-// Omni-Attention MMA kernel with sparse block support
-// Based on flash_attn_mma_stages_split_q_shared_kv, but supports:
-// - Block-sparse attention via kv_indices and block_mask_types
-// - Per-block mask types: MASKED (skip), CAUSAL (causal mask), FULL (no mask)
-// - Only processes active KV blocks specified by kv_indices
+// Omni-Attention: Block-sparse attention with FA2 split-Q tiling
+// Supports MASKED (skip), CAUSAL (lower-triangular), FULL (dense) block types
 
-// Block mask types
-#define BLOCK_MASK_MASKED 0  // Skip block entirely
-#define BLOCK_MASK_CAUSAL 1  // Apply causal masking
-#define BLOCK_MASK_FULL 2    // No masking
+#define BLOCK_MASK_MASKED 0
+#define BLOCK_MASK_CAUSAL 1
+#define BLOCK_MASK_FULL 2
+
+// -----------------------------------------------------------------------------
+// Simple, correctness-first CUDA kernel (no MMA, no cp.async)
+//
+// This kernel is intentionally straightforward:
+// - One thread computes a full output row [head_dim] for a single (batch, head, q)
+// - It walks the block mask (kv_num_blocks / kv_indices / block_mask_types)
+// - It recomputes QK^T twice (for max and for sum/weighted value) in fp32
+// - It applies FULL / CAUSAL / MASKED semantics to match OmniBlockMask.to_score_mask()
+//
+// This is NOT performance-oriented, but is much easier to reason about and
+// serves as a correctness baseline before enabling the optimized MMA kernel.
+// -----------------------------------------------------------------------------
+__global__ void omni_attn_simple_kernel(
+    half *__restrict__ Q,
+    half *__restrict__ K,
+    half *__restrict__ V,
+    half *__restrict__ O,
+    const int *__restrict__ kv_num_blocks,
+    const int *__restrict__ kv_indices,
+    const int *__restrict__ block_mask_types,
+    int QKV_seqlen,
+    int QKV_head,
+    int QKV_batch,
+    int num_q_blocks,
+    int max_blocks,
+    int kv_num_blocks_stride0,
+    int kv_num_blocks_stride1,
+    int kv_num_blocks_stride2,
+    int kv_indices_stride0,
+    int kv_indices_stride1,
+    int kv_indices_stride2,
+    int kv_indices_stride3,
+    int block_mask_types_stride0,
+    int block_mask_types_stride1,
+    int block_mask_types_stride2,
+    int block_mask_types_stride3,
+    int head_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_q = QKV_batch * QKV_head * QKV_seqlen;
+  if (tid >= total_q) {
+    return;
+  }
+
+  // Map linear thread id -> (batch_id, head_id, q_idx)
+  int q_idx = tid % QKV_seqlen;
+  int tmp = tid / QKV_seqlen;
+  int head_id = tmp % QKV_head;
+  int batch_id = tmp / QKV_head;
+
+  // Derive block size used by the block mask from (seqlen, num_q_blocks).
+  // In all current tests, seqlen is an exact multiple of BLOCK_SIZE.
+  int q_block_size = div_ceil(QKV_seqlen, num_q_blocks);
+  if (q_block_size <= 0) {
+    return;
+  }
+  int q_block = q_idx / q_block_size;
+  if (q_block >= num_q_blocks) {
+    q_block = num_q_blocks - 1;
+  }
+
+  int kv_nb = kv_num_blocks[batch_id * kv_num_blocks_stride0 +
+                            head_id * kv_num_blocks_stride1 +
+                            q_block * kv_num_blocks_stride2];
+
+  const int qkv_offset =
+      (batch_id * QKV_head + head_id) * QKV_seqlen * head_dim;
+  const int q_row_offset = qkv_offset + q_idx * head_dim;
+
+  const float scale = 1.0f / sqrtf((float)head_dim);
+
+  // ---------------------------------------------------------------------------
+  // Pass 1: find row max over all valid KV positions (respecting block mask)
+  // ---------------------------------------------------------------------------
+  float max_score = -INFINITY;
+
+  for (int kv_idx = 0; kv_idx < kv_nb; ++kv_idx) {
+    int indices_off = batch_id * kv_indices_stride0 +
+                      head_id * kv_indices_stride1 +
+                      q_block * kv_indices_stride2 +
+                      kv_idx * kv_indices_stride3;
+    int kv_block = kv_indices[indices_off];
+
+    int mask_type = block_mask_types[batch_id * block_mask_types_stride0 +
+                                     head_id * block_mask_types_stride1 +
+                                     q_block * block_mask_types_stride2 +
+                                     kv_idx * block_mask_types_stride3];
+
+    if (mask_type == BLOCK_MASK_MASKED) {
+      continue;
+    }
+
+    int kv_block_start = kv_block * q_block_size;
+    int kv_block_end = min(kv_block_start + q_block_size, QKV_seqlen);
+
+    int kv_start = kv_block_start;
+    int kv_end = kv_block_end;
+
+    // CAUSAL semantics: within this block, only attend to positions <= q_idx.
+    if (mask_type == BLOCK_MASK_CAUSAL) {
+      if (q_idx < kv_block_start) {
+        // For this row, the whole block is in the future.
+        continue;
+      }
+      kv_end = min(kv_end, q_idx + 1);
+    }
+
+    for (int kv = kv_start; kv < kv_end; ++kv) {
+      int k_row_offset = qkv_offset + kv * head_dim;
+      float score = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        float qv = __half2float(Q[q_row_offset + d]);
+        float kvv = __half2float(K[k_row_offset + d]);
+        score += qv * kvv;
+      }
+      score *= scale;
+      if (score > max_score) {
+        max_score = score;
+      }
+    }
+  }
+
+  // If everything is masked, emit zeros.
+  if (max_score == -INFINITY) {
+    for (int d = 0; d < head_dim; ++d) {
+      O[q_row_offset + d] = __float2half(0.0f);
+    }
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pass 2: compute softmax and P@V in fp32, then normalize
+  // ---------------------------------------------------------------------------
+  float sum_exp = 0.0f;
+  constexpr int kMaxHeadDim = 256;
+  float out[kMaxHeadDim];
+  for (int d = 0; d < head_dim; ++d) {
+    out[d] = 0.0f;
+  }
+
+  for (int kv_idx = 0; kv_idx < kv_nb; ++kv_idx) {
+    int indices_off = batch_id * kv_indices_stride0 +
+                      head_id * kv_indices_stride1 +
+                      q_block * kv_indices_stride2 +
+                      kv_idx * kv_indices_stride3;
+    int kv_block = kv_indices[indices_off];
+
+    int mask_type = block_mask_types[batch_id * block_mask_types_stride0 +
+                                     head_id * block_mask_types_stride1 +
+                                     q_block * block_mask_types_stride2 +
+                                     kv_idx * block_mask_types_stride3];
+
+    if (mask_type == BLOCK_MASK_MASKED) {
+      continue;
+    }
+
+    int kv_block_start = kv_block * q_block_size;
+    int kv_block_end = min(kv_block_start + q_block_size, QKV_seqlen);
+
+    int kv_start = kv_block_start;
+    int kv_end = kv_block_end;
+
+    if (mask_type == BLOCK_MASK_CAUSAL) {
+      if (q_idx < kv_block_start) {
+        continue;
+      }
+      kv_end = min(kv_end, q_idx + 1);
+    }
+
+    for (int kv = kv_start; kv < kv_end; ++kv) {
+      int k_row_offset = qkv_offset + kv * head_dim;
+      float score = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        float qv = __half2float(Q[q_row_offset + d]);
+        float kvv = __half2float(K[k_row_offset + d]);
+        score += qv * kvv;
+      }
+      score *= scale;
+      float w = __expf(score - max_score);
+      sum_exp += w;
+
+      for (int d = 0; d < head_dim; ++d) {
+        float vv = __half2float(V[k_row_offset + d]);
+        out[d] += w * vv;
+      }
+    }
+  }
+
+  if (sum_exp <= 0.0f) {
+    for (int d = 0; d < head_dim; ++d) {
+      O[q_row_offset + d] = __float2half(0.0f);
+    }
+    return;
+  }
+
+  float inv_sum = 1.0f / sum_exp;
+  for (int d = 0; d < head_dim; ++d) {
+    O[q_row_offset + d] = __float2half(out[d] * inv_sum);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Optimized MMA kernel (kept for future re-enablement once correctness
+// is fully validated with the simple kernel above).
+// -----------------------------------------------------------------------------
 
 template <
-    const int kHeadDim,          // Headdim, 32,64,128
-    const int kMmaAtomM,         // MMA Atom M, 16
-    const int kMmaAtomN,         // MMA Atom N, 8
-    const int kMmaAtomK,         // MMA Atom K, 16
-    const int kMmaTileSeqLenQ,   // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M),
-                                 // d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenK,   // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M),
-                                 // d(K)]@[d(K),  Bc(N)]
-    const int kMmaTileSeqLenP,   // 4, more MMA(warp), M=16*4=64, P@V
-                                 // =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kMmaTileHeadDimV,  // 1, more MMA(warp), N=8*1 =8,  P@V
-                                 // =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-    const int kWarpTileSeqLenQ,  // 1, more values, M, Br=64*1=64, matmul M
-    const int kWarpTileSeqLenK,  // 8, more values, N, Bc=8*8 =64, matmul N
-    const int kWarpTileSeqLenP,  // 1, more values, M, Br=64*1=64, matmul M
-    const int kWarpTileHeadDimV, // 8, more values, N,
-                                 // d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-    const int kOStorageAccFloat32, // 0/1, MMA Acc always be fp16, but O
-                                   // storage can be fp32 or half.
-    const int kStage,              // 1,2
-    const int kPadQ,               // Pad Q/K/V 0,8
-    const int kPadK, const int kPadV>
-__global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
+    const int kHeadDim, const int kMmaAtomM, const int kMmaAtomN, const int kMmaAtomK,
+    const int kMmaTileSeqLenQ, const int kMmaTileSeqLenK,
+    const int kMmaTileSeqLenP, const int kMmaTileHeadDimV,
+    const int kWarpTileSeqLenQ, const int kWarpTileSeqLenK,
+    const int kWarpTileSeqLenP, const int kWarpTileHeadDimV,
+    const int kOStorageAccFloat32, const int kStage,
+    const int kPadQ, const int kPadK, const int kPadV>
+__global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     omni_attn_mma_stages_split_q_shared_kv_kernel(
-        half *Q, half *K, half *V,
-        half *O, 
-        int *kv_num_blocks,      // [batch, nheads, num_q_blocks]
-        int *kv_indices,         // [batch, nheads, num_q_blocks, max_blocks]
-        int *block_mask_types,   // [batch, nheads, num_q_blocks, max_blocks]
+        half *__restrict__ Q, half *__restrict__ K, half *__restrict__ V,
+        half *__restrict__ O,
+        const int *__restrict__ kv_num_blocks,
+        const int *__restrict__ kv_indices,
+        const int *__restrict__ block_mask_types,
         int QKV_seqlen, int QKV_head, int QKV_batch,
         int num_q_blocks, int max_blocks,
         int kv_num_blocks_stride0, int kv_num_blocks_stride1, int kv_num_blocks_stride2,
         int kv_indices_stride0, int kv_indices_stride1, int kv_indices_stride2, int kv_indices_stride3,
         int block_mask_types_stride0, int block_mask_types_stride1, int block_mask_types_stride2, int block_mask_types_stride3) {
-  // Matmul Layout: Q[Br,d]@K^T[d,Bc] NT, P[Br,Bc]@V[Bc,d] NN.
-  // NOTE: K[Bc,d] with row major means K^T[d,Bc] in col major.
-  static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 &&
-                kMmaAtomK == 16);                                 // m16n8k16
-  static_assert(kMmaTileSeqLenQ <= 8 && kMmaTileSeqLenK == 1);    // Q@K^T
-  static_assert(kMmaTileSeqLenP <= 8 && kMmaTileHeadDimV == 1);   // P@V
-  static_assert(kWarpTileSeqLenQ == 1 && kWarpTileSeqLenK <= 16); // Q@K^T
-  // kWarpTileHeadDimV: d=8*(1|2|3|4|...) = 8|...|32|64|96|128|..., etc.
-  // e.g, kWarpTileHeadDimV = 8 -> d = 8*8 = 64; 16 -> d = 8*16 = 128.
-  static_assert(kWarpTileSeqLenP == 1 &&
-                kWarpTileHeadDimV ==
-                    (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV))); // P@V
-  static_assert(kOStorageAccFloat32 == 0 || kOStorageAccFloat32 == 1);
-  static_assert(kStage < 3 && kStage > 0);
-  static_assert(kPadQ >= 0 && kPadQ % 8 == 0); // 0,8,16
-  static_assert(kPadK >= 0 && kPadK % 8 == 0); // 0,8,16
-  static_assert(kPadV >= 0 && kPadV % 8 == 0); // 0,8,16
-  constexpr int Br =
-      kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ; // 16*4*1=64
-  constexpr int Bc =
-      kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK; //  8*1*8=64
-  static_assert(Br >= Bc); // for shared memory reuse.
-  constexpr int kNumThreads =
-      WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
-  const float scale = 1.0f / sqrt((float)kHeadDim);
 
-  // grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head), (x,y,z)
-  const int QKV_batch_id = blockIdx.y / QKV_head; // Batch size
-  const int QKV_head_id = blockIdx.y % QKV_head;  // Head num
-  const int Q_tile_id = blockIdx.x;               // Q tile_id, range [0, num_q_blocks)
-  const int O_tile_id = Q_tile_id;                // O tile_id, same as Q.
-  const int tid = threadIdx.x;                    // within block
-  const int warp_id = tid / WARP_SIZE;            // 0~7 warp_id within block
-  const int lane_id = tid % WARP_SIZE;            // 0~31
-  const int warp_QP = warp_id;                    // 0,1,2,3 or 0~7
-  const int warp_KV = 0;                          // 0
+  static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16);
+  static_assert(kMmaTileSeqLenQ <= 8 && kMmaTileSeqLenK == 1);
+  static_assert(kMmaTileSeqLenP <= 8 && kMmaTileHeadDimV == 1);
+  static_assert(kWarpTileSeqLenQ == 1 && kWarpTileSeqLenK <= 16);
+  static_assert(kWarpTileSeqLenP == 1 && kWarpTileHeadDimV == (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV)));
+  static_assert(kStage >= 1 && kStage <= 2);
+  static_assert(kPadQ % 8 == 0 && kPadK % 8 == 0 && kPadV % 8 == 0);
 
-  const int Q_gmem_offset =
-      ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
-       (QKV_head_id * QKV_seqlen * kHeadDim)); // Q [seqlen,d]
-  const int K_gmem_offset =
-      ((QKV_batch_id * QKV_head * QKV_seqlen * kHeadDim) +
-       (QKV_head_id * QKV_seqlen * kHeadDim)); // K [seqlen,d]
-  const int V_gmem_offset = Q_gmem_offset;     // V [seqlen,d]
-  const int O_gmem_offset = Q_gmem_offset;     // O [seqlen,d]
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+  const float scale = 1.0f / sqrtf((float)kHeadDim);
 
-  // Mapping Q gmem -> tid -> smem, Q[Br,d]=[64,64 or 128], 128 threads.
-  int load_smem_Q_Br = (tid / (kNumThreads / Br)); // Br 64, tid / 2, row 0~64
-  int load_smem_Q_d =
-      (tid % (kNumThreads / Br)) *
-      (kHeadDim / (kNumThreads / Br)); // (tid % 2) * 32, 0,32,...
-  // Mapping K gmem -> tid -> smem, K[Bc,d]=[64 or 128,64], 128 threads.
-  int load_smem_K_Bc = (tid / (kNumThreads / Bc)); // Bc 64, tid / 2, row 0~64
-  int load_smem_K_d =
-      (tid % (kNumThreads / Bc)) *
-      (kHeadDim / (kNumThreads / Bc)); // (tid % 2) * 32, 0,32,...
-  // Mapping V gmem -> tid -> smem, V[Bc,d]=[64,64 or 128], 128 threads.
-  int load_smem_V_Bc = (tid / (kNumThreads / Bc)); // Bc 64, tid / 2, row 0~64
-  int load_smem_V_d =
-      (tid % (kNumThreads / Bc)) *
-      (kHeadDim / (kNumThreads / Bc)); // (tid % 2) * 32, 0,32,...
-  // global Q row of current head for tile [Br,d] per block.
-  int load_gmem_Q_Br = Q_tile_id * Br + load_smem_Q_Br;
-  if (load_gmem_Q_Br >= QKV_seqlen)
-    return;
+  const int batch_id = blockIdx.y / QKV_head;
+  const int head_id = blockIdx.y % QKV_head;
+  const int q_tile_id = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const int warp_QP = warp_id;
 
-  // Shared memory for Q,K,V, we don not need additional smem for O
-  // collective store which perform via registers reuse and warp shuffle.
+  const int qkv_offset = (batch_id * QKV_head + head_id) * QKV_seqlen * kHeadDim;
+
+  // Thread-to-tile mapping for coalesced loads
+  const int load_row = tid / (kNumThreads / Br);
+  const int load_col = (tid % (kNumThreads / Br)) * (kHeadDim / (kNumThreads / Br));
+  const int gmem_q_row = q_tile_id * Br + load_row;
+  
+  if (gmem_q_row >= QKV_seqlen) return;
+
   extern __shared__ half smem[];
-  constexpr int Q_tile_size =
-      Br * (kHeadDim + kPadQ); // 64*64=4096, ~8192 bytes=8M
-  constexpr int K_tile_size = Bc * (kHeadDim + kPadK); // K[Bc,d]
-  constexpr int V_tile_size = Bc * (kHeadDim + kPadV); // V[Bc,d]
-  half *Q_tile_smem = smem;                            // 8M/16M
-  half *K_tile_smem = Q_tile_smem + Q_tile_size;       // 8M/16M
-  half *V_tile_smem = K_tile_smem; // KV shared the same smem
+  constexpr int Q_tile_size = Br * (kHeadDim + kPadQ);
+  constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
+  constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
+  half *Q_smem = smem;
+  half *K_smem = Q_smem + Q_tile_size;
+  half *V_smem = K_smem;  // KV share smem
 
-  uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);
-  uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
-  uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
+  uint32_t Q_smem_ptr = __cvta_generic_to_shared(Q_smem);
+  uint32_t K_smem_ptr = __cvta_generic_to_shared(K_smem);
+  uint32_t V_smem_ptr = __cvta_generic_to_shared(V_smem);
 
-  // Registers/SMEM for thread block
-  // block m_old, l_old, store in lane, use float to
-  // keep precision.
-  float lane_block_row_max_old[kWarpTileSeqLenQ][2]; // [1][2]
-  float lane_block_row_sum_old[kWarpTileSeqLenQ][2]; // [1][2]
-  fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
-  fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
+  // Online softmax state
+  float row_max_old[kWarpTileSeqLenQ][2];
+  float row_sum_old[kWarpTileSeqLenQ][2];
+  fill_2D_regs<float, kWarpTileSeqLenQ, 2>(row_max_old, -INFINITY);
+  fill_2D_regs<float, kWarpTileSeqLenQ, 2>(row_sum_old, 0.0f);
 
-  // Registers for S=Q@K^T/O=P@V
-  constexpr bool kCanPrefetchQs2r =
-      ((kHeadDim / kMmaAtomK) <= 8) && (kHeadDim < 64);
-  constexpr bool kDelayPrefetchQs2r =
-      (true && kCanPrefetchQs2r);                   // TODO: make it optional.
-  constexpr bool kCanPrefetchKVg2s = (kStage == 2); // whether prefetch KV g2s.
-  constexpr int kPrefetchKg2sSmemId = 0;            // smem id for K g2s, 0.
-  constexpr int kPrefetchVg2sSmemId =
-      kCanPrefetchKVg2s ? 1 : 0; // smem id for V g2s, 1.
-  constexpr int kNumPrefetchQs2r =
-      (kCanPrefetchQs2r) ? (kHeadDim / kMmaAtomK) : 1;
-  uint32_t R_Q[kNumPrefetchQs2r][kWarpTileSeqLenQ][4]; // [4/8/1][1][4]
-  uint32_t R_K[kWarpTileSeqLenK][2];                   // [8][2]
-  uint32_t R_V[kWarpTileHeadDimV][2];                  // [8][2]
-  // registers for current tile_K_seqlen within, [64,64] = S_tile[Br,Bc]
-  // = Q_tile[Br,d] * K[Bc,d], each thread hold 2x32 bits regs.
-  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][2]; // [1][8][2]
-  // registers for tile_K_seqlen O=PV[Br,d]=P@V, [2][2/4][2], 8 or 16 regs.
-  uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][2]; // [1][8][2]
-  // registers final Output [D]=final rescale(R_O), [2][2/4][2], 8 or 16 regs.
-  uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV]
-              [(kOStorageAccFloat32) ? 4 : 2];
-  fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV,
-               ((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
+  // Register allocation
+  constexpr bool kPrefetchQ = ((kHeadDim / kMmaAtomK) <= 8) && (kHeadDim < 64);
+  constexpr bool kPrefetchKV = (kStage == 2);
+  constexpr int kNumQRegs = kPrefetchQ ? (kHeadDim / kMmaAtomK) : 1;
+  
+  uint32_t R_Q[kNumQRegs][kWarpTileSeqLenQ][4];
+  uint32_t R_K[kWarpTileSeqLenK][2];
+  uint32_t R_V[kWarpTileHeadDimV][2];
+  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][2];
+  uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][2];
+  uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][kOStorageAccFloat32 ? 4 : 2];
+  fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, (kOStorageAccFloat32 ? 4 : 2)>(R_D, 0);
 
-  // load Q from gmem -> smem, only load once.
+  // Load Q tile once
   {
-    int load_gmem_Q_d = load_smem_Q_d;
-    int load_gmem_Q_addr =
-        (Q_gmem_offset + load_gmem_Q_Br * kHeadDim + load_gmem_Q_d);
-    uint32_t load_smem_Q_ptr =
-        (smem_Q_base_ptr +
-         (load_smem_Q_Br * (kHeadDim + kPadQ) + load_gmem_Q_d) * sizeof(half));
-#pragma unroll
+    int addr = qkv_offset + gmem_q_row * kHeadDim + load_col;
+    uint32_t sptr = Q_smem_ptr + (load_row * (kHeadDim + kPadQ) + load_col) * sizeof(half);
+    #pragma unroll
     for (int i = 0; i < (kHeadDim / (kNumThreads / Br)); i += 8) {
-      CP_ASYNC_CG(load_smem_Q_ptr + i * 2, &Q[load_gmem_Q_addr + i], 16);
+      CP_ASYNC_CG(sptr + i * 2, &Q[addr + i], 16);
     }
     CP_ASYNC_COMMIT_GROUP();
   }
 
-  // Get number of active KV blocks for this Q block
-  int kv_num_blocks_offset = QKV_batch_id * kv_num_blocks_stride0 +
-                             QKV_head_id * kv_num_blocks_stride1 +
-                             Q_tile_id * kv_num_blocks_stride2;
-  int num_active_kv_blocks = kv_num_blocks[kv_num_blocks_offset];
+  // Get active KV block count
+  int num_kv = kv_num_blocks[batch_id * kv_num_blocks_stride0 + 
+                              head_id * kv_num_blocks_stride1 + 
+                              q_tile_id * kv_num_blocks_stride2];
 
-  // <loop over active KV blocks>: Instead of looping over all KV blocks,
-  // we only process blocks specified by kv_indices
-#pragma unroll 1
-  for (int active_kv_idx = 0; active_kv_idx < num_active_kv_blocks; ++active_kv_idx) {
-    // Get KV block index and mask type
-    int kv_indices_offset = QKV_batch_id * kv_indices_stride0 +
-                            QKV_head_id * kv_indices_stride1 +
-                            Q_tile_id * kv_indices_stride2 +
-                            active_kv_idx * kv_indices_stride3;
-    int kv_block_col_idx = kv_indices[kv_indices_offset];
-    
-    int block_mask_types_offset = QKV_batch_id * block_mask_types_stride0 +
-                                  QKV_head_id * block_mask_types_stride1 +
-                                  Q_tile_id * block_mask_types_stride2 +
-                                  active_kv_idx * block_mask_types_stride3;
-    int mask_type = block_mask_types[block_mask_types_offset];
+  // Main loop over active KV blocks
+  #pragma unroll 1
+  for (int kv_idx = 0; kv_idx < num_kv; ++kv_idx) {
+    int indices_off = batch_id * kv_indices_stride0 + head_id * kv_indices_stride1 + 
+                      q_tile_id * kv_indices_stride2 + kv_idx * kv_indices_stride3;
+    int kv_block = kv_indices[indices_off];
+    int mask_type = block_mask_types[batch_id * block_mask_types_stride0 + 
+                                      head_id * block_mask_types_stride1 +
+                                      q_tile_id * block_mask_types_stride2 + 
+                                      kv_idx * block_mask_types_stride3];
 
-    // Skip if fully masked
-    if (mask_type == BLOCK_MASK_MASKED) {
-      continue;
-    }
+    if (mask_type == BLOCK_MASK_MASKED) continue;
 
-    // Calculate KV block offset in sequence
-    int load_gmem_K_Bc_offset = kv_block_col_idx * Bc;
-    int load_gmem_V_Bc_offset = kv_block_col_idx * Bc;
+    int kv_offset = kv_block * Bc;
 
-    // Load K tile from gmem -> smem
-    if constexpr (kCanPrefetchKVg2s) {
-      if (active_kv_idx == 0) {
-        int load_gmem_K_Bc = load_gmem_K_Bc_offset + load_smem_K_Bc;
-        int load_gmem_K_d = load_smem_K_d;
-        int load_gmem_K_addr =
-            (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
-        uint32_t load_smem_K_ptr =
-            (smem_K_base_ptr +
-             (kPrefetchKg2sSmemId * K_tile_size +
-              load_smem_K_Bc * (kHeadDim + kPadK) + load_gmem_K_d) *
-                 sizeof(half));
-#pragma unroll
+    // Load K
+    if constexpr (kPrefetchKV) {
+      if (kv_idx == 0 && load_row < Bc) {
+        int addr = qkv_offset + (kv_offset + load_row) * kHeadDim + load_col;
+        uint32_t sptr = K_smem_ptr + (load_row * (kHeadDim + kPadK) + load_col) * sizeof(half);
+        #pragma unroll
         for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-          CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
+          CP_ASYNC_CG(sptr + i * 2, &K[addr + i], 16);
         }
         CP_ASYNC_COMMIT_GROUP();
+      }
+      if (kv_idx == 0) {
         CP_ASYNC_WAIT_GROUP(0);
         __syncthreads();
       }
-      // Prefetch V g2s
-      {
-        int load_gmem_V_Bc = load_gmem_V_Bc_offset + load_smem_V_Bc;
-        int load_gmem_V_d = load_smem_V_d;
-        int load_gmem_V_addr =
-            (V_gmem_offset + load_gmem_V_Bc * kHeadDim + load_gmem_V_d);
-        uint32_t load_smem_V_ptr =
-            (smem_V_base_ptr +
-             (kPrefetchVg2sSmemId * V_tile_size +
-              load_gmem_V_Bc * (kHeadDim + kPadV) + load_gmem_V_d) *
-                 sizeof(half));
-#pragma unroll
+      // Prefetch V (alternate between two buffers for double-buffering)
+      if (load_row < Bc) {
+        int addr = qkv_offset + (kv_offset + load_row) * kHeadDim + load_col;
+        int v_buffer_offset = (kv_idx & 1) * K_tile_size;  // 0 or K_tile_size
+        uint32_t sptr = V_smem_ptr + (v_buffer_offset + load_row * (kHeadDim + kPadV) + load_col) * sizeof(half);
+        #pragma unroll
         for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-          CP_ASYNC_CG(load_smem_V_ptr + i * 2, &V[load_gmem_V_addr + i], 16);
+          CP_ASYNC_CG(sptr + i * 2, &V[addr + i], 16);
         }
         CP_ASYNC_COMMIT_GROUP();
       }
     } else {
-      int load_gmem_K_Bc = load_gmem_K_Bc_offset + load_smem_K_Bc;
-      int load_gmem_K_d = load_smem_K_d;
-      int load_gmem_K_addr =
-          (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
-      uint32_t load_smem_K_ptr =
-          (smem_K_base_ptr +
-           (kPrefetchKg2sSmemId * K_tile_size +
-            load_gmem_K_Bc * (kHeadDim + kPadK) + load_gmem_K_d) *
-               sizeof(half));
-#pragma unroll
-      for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-        CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
+      if (load_row < Bc) {
+        int addr = qkv_offset + (kv_offset + load_row) * kHeadDim + load_col;
+        uint32_t sptr = K_smem_ptr + (load_row * (kHeadDim + kPadK) + load_col) * sizeof(half);
+        #pragma unroll
+        for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
+          CP_ASYNC_CG(sptr + i * 2, &K[addr + i], 16);
+        }
+        CP_ASYNC_COMMIT_GROUP();
       }
-      CP_ASYNC_COMMIT_GROUP();
       CP_ASYNC_WAIT_GROUP(0);
       __syncthreads();
     }
 
-    // Prefetch Q s2r
-    if constexpr (kCanPrefetchQs2r && (!kDelayPrefetchQs2r)) {
-      if (active_kv_idx == 0) {
-        if constexpr (!kCanPrefetchKVg2s) {
-          CP_ASYNC_WAIT_GROUP(0);
-        } else {
-          CP_ASYNC_WAIT_GROUP(1);
-        }
+    // Load Q into registers on first iteration
+    if constexpr (kPrefetchQ) {
+      if (kv_idx == 0) {
+        if constexpr (!kPrefetchKV) { CP_ASYNC_WAIT_GROUP(0); }
+        else { CP_ASYNC_WAIT_GROUP(1); }
         __syncthreads();
-
-#pragma unroll
-        for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-#pragma unroll
-          for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-            int warp_smem_Q_Br =
-                warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-            int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-            int lane_smem_Q_d =
-                tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-            uint32_t lane_smem_Q_ptr =
-                (smem_Q_base_ptr +
-                 (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) *
-                     sizeof(half));
-            LDMATRIX_X4(R_Q[tile_K_d][i][0], R_Q[tile_K_d][i][1],
-                        R_Q[tile_K_d][i][2], R_Q[tile_K_d][i][3],
-                        lane_smem_Q_ptr);
-          }
+        #pragma unroll
+        for (int d = 0; d < (kHeadDim / kMmaAtomK); ++d) {
+          int row = warp_QP * kMmaAtomM + lane_id % 16;
+          int col = d * kMmaAtomK + (lane_id / 16) * 8;
+          uint32_t ptr = Q_smem_ptr + (row * (kHeadDim + kPadQ) + col) * sizeof(half);
+          LDMATRIX_X4(R_Q[d][0][0], R_Q[d][0][1], R_Q[d][0][2], R_Q[d][0][3], ptr);
         }
         __syncthreads();
       }
     }
 
-    // Compute S = Q@K^T
+    // Compute S = Q @ K^T
     fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
-#pragma unroll
-    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      if constexpr (!kCanPrefetchQs2r) {
-#pragma unroll
-        for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-          int warp_smem_Q_Br =
-              warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-          int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-          int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-          uint32_t lane_smem_Q_ptr =
-              (smem_Q_base_ptr +
-               (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) *
-                   sizeof(half));
-          LDMATRIX_X4(R_Q[0][i][0], R_Q[0][i][1], R_Q[0][i][2], R_Q[0][i][3],
-                      lane_smem_Q_ptr);
-        }
-      } else {
-        if constexpr (kDelayPrefetchQs2r) {
-          if (active_kv_idx == 0) {
-            if (tile_K_d == 0) {
-              if constexpr (!kCanPrefetchKVg2s) {
-                CP_ASYNC_WAIT_GROUP(0);
-              } else {
-                CP_ASYNC_WAIT_GROUP(1);
-              }
-              __syncthreads();
-            }
-#pragma unroll
-            for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-              int warp_smem_Q_Br =
-                  warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-              int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-              int lane_smem_Q_d =
-                  tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-              uint32_t lane_smem_Q_ptr =
-                  (smem_Q_base_ptr +
-                   (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) *
-                       sizeof(half));
-              LDMATRIX_X4(R_Q[tile_K_d][i][0], R_Q[tile_K_d][i][1],
-                          R_Q[tile_K_d][i][2], R_Q[tile_K_d][i][3],
-                          lane_smem_Q_ptr);
-            }
-          }
-        }
+    #pragma unroll
+    for (int d = 0; d < (kHeadDim / kMmaAtomK); ++d) {
+      if constexpr (!kPrefetchQ) {
+        int row = warp_QP * kMmaAtomM + lane_id % 16;
+        int col = d * kMmaAtomK + (lane_id / 16) * 8;
+        uint32_t ptr = Q_smem_ptr + (row * (kHeadDim + kPadQ) + col) * sizeof(half);
+        LDMATRIX_X4(R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3], ptr);
       }
 
-      // Load K
-#pragma unroll
+      #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        int warp_smem_K_Bc =
-            warp_KV * (kMmaAtomN * kWarpTileSeqLenK) + j * kMmaAtomN;
-        int lane_smem_K_Bc = warp_smem_K_Bc + lane_id % 8;
-        int lane_smem_K_d =
-            tile_K_d * kMmaAtomK + ((lane_id / 8) % 2) * 8;
-        uint32_t lane_smem_K_ptr =
-            (smem_K_base_ptr +
-             (kPrefetchKg2sSmemId * K_tile_size +
-              lane_smem_K_Bc * (kHeadDim + kPadK) + lane_smem_K_d) *
-                 sizeof(half));
-        LDMATRIX_X2(R_K[j][0], R_K[j][1], lane_smem_K_ptr);
+        int k_row = j * kMmaAtomN + lane_id % 8;
+        int k_col = d * kMmaAtomK + ((lane_id / 8) % 2) * 8;
+        uint32_t ptr = K_smem_ptr + (k_row * (kHeadDim + kPadK) + k_col) * sizeof(half);
+        LDMATRIX_X2(R_K[j][0], R_K[j][1], ptr);
       }
 
-      // MMA compute
-      if constexpr (kCanPrefetchQs2r) {
-        static_assert(kWarpTileSeqLenQ == 1);
-        {
-#pragma unroll
-          for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-            HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[tile_K_d][0][0],
-                      R_Q[tile_K_d][0][1], R_Q[tile_K_d][0][2],
-                      R_Q[tile_K_d][0][3], R_K[j][0], R_K[j][1], R_S[0][j][0],
-                      R_S[0][j][1]);
-          }
-        }
-      } else {
-        static_assert(kWarpTileSeqLenQ == 1);
-        {
-#pragma unroll
-          for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-            HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[0][0][0], R_Q[0][0][1],
-                      R_Q[0][0][2], R_Q[0][0][3], R_K[j][0], R_K[j][1],
-                      R_S[0][j][0], R_S[0][j][1]);
-          }
-        }
+      int q_idx = kPrefetchQ ? d : 0;
+      #pragma unroll
+      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+        HMMA16816(R_S[0][j][0], R_S[0][j][1],
+                  R_Q[q_idx][0][0], R_Q[q_idx][0][1], R_Q[q_idx][0][2], R_Q[q_idx][0][3],
+                  R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1]);
       }
-    } // end loop over d, S=Q@K^T
+    }
+    
+    // Apply scale to QK^T scores
+    #pragma unroll
+    for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+      half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
+      S[0] = __hmul(S[0], __float2half(scale));
+      S[1] = __hmul(S[1], __float2half(scale));
+      S[2] = __hmul(S[2], __float2half(scale));
+      S[3] = __hmul(S[3], __float2half(scale));
+    }
     __syncthreads();
 
-    // Apply causal masking if needed
+    // Apply causal mask - correct MMA m16n8k16 fragment layout
     if (mask_type == BLOCK_MASK_CAUSAL) {
-      // Apply causal mask: q_idx >= kv_idx (using global sequence indices)
-      // The MMA fragment layout for m16n8k16 distributes elements across threads
-      // We need to apply the mask based on the actual global Q and KV positions
-      static_assert(kWarpTileSeqLenQ == 1);
-      {
-        // Calculate global Q block start
-        int q_block_start = Q_tile_id * Br;
-        int kv_block_start = kv_block_col_idx * Bc;
+      int q_base = q_tile_id * Br + warp_QP * kMmaAtomM;
+      int kv_base = kv_block * Bc;
+      
+      // MMA m16n8k16 output layout: thread lane_id holds elements at:
+      // row_0 = lane_id % 8,     row_1 = lane_id % 8 + 8
+      // col = (lane_id / 8) * 2, col + 1
+      int row_in_tile = lane_id % 8;
+      int col_pair = (lane_id / 8) * 2;  // 0, 2, 4, or 6
+      
+      #pragma unroll
+      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+        int q_row_0 = q_base + row_in_tile;
+        int q_row_1 = q_base + row_in_tile + 8;
+        int kv_col = kv_base + j * kMmaAtomN + col_pair;
         
-#pragma unroll
-        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-          // Calculate warp-level offsets
-          int warp_q_start = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ);
-          int warp_kv_start = warp_KV * (kMmaAtomN * kWarpTileSeqLenK) + j * kMmaAtomN;
-          
-          // For m16n8k16 MMA, the fragment layout is:
-          // Each thread holds elements from rows [warp_q_start + (lane_id % 16) + row_offset]
-          // and columns [warp_kv_start + (lane_id % 8) + col_offset]
-          // The exact mapping depends on the MMA instruction layout
-          // For simplicity, we apply the mask conservatively:
-          // - Check if the Q row is before the KV block start
-          // - Apply mask to all elements in that row if q_global < kv_block_start
-          
-          int q_row_in_warp = lane_id % 16;  // 0-15
-          int q_global_row = q_block_start + warp_q_start + q_row_in_warp;
-          
-          // If this Q row is before the KV block, mask all elements
-          if (q_global_row < kv_block_start) {
-            half *t_hptr_S = reinterpret_cast<half *>(&(R_S[0][j][0]));
-            t_hptr_S[0] = __float2half(-INFINITY);
-            t_hptr_S[1] = __float2half(-INFINITY);
-            t_hptr_S[2] = __float2half(-INFINITY);
-            t_hptr_S[3] = __float2half(-INFINITY);
-          } else {
-            // For elements within the block, check element-wise
-            // The MMA fragment has 4 half values per thread
-            // Approximate mapping: elements correspond to different columns
-            int kv_col_in_warp = lane_id % 8;  // 0-7
-            int kv_global_col_base = kv_block_start + warp_kv_start + kv_col_in_warp;
-            
-            half *t_hptr_S = reinterpret_cast<half *>(&(R_S[0][j][0]));
-            // Apply mask element-wise: q_global_row >= kv_global_col
-            // For the 4 elements, they roughly correspond to columns at offsets
-            for (int elem = 0; elem < 4; ++elem) {
-              // Approximate column mapping for m16n8k16 fragment
-              int kv_col_offset = (elem / 2) * 8 + (elem % 2) * 4;
-              int kv_global_col = kv_global_col_base + kv_col_offset;
-              
-              if (q_global_row < kv_global_col) {
-                t_hptr_S[elem] = __float2half(-INFINITY);
-              }
-            }
-          }
-        }
+        half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
+        // c0: (row_0, col), c1: (row_0, col+1), c2: (row_1, col), c3: (row_1, col+1)
+        if (q_row_0 < kv_col)     S[0] = __float2half(-INFINITY);
+        if (q_row_0 < kv_col + 1) S[1] = __float2half(-INFINITY);
+        if (q_row_1 < kv_col)     S[2] = __float2half(-INFINITY);
+        if (q_row_1 < kv_col + 1) S[3] = __float2half(-INFINITY);
       }
     }
 
     // Load V if not prefetched
-    if constexpr (!kCanPrefetchKVg2s) {
-      int load_gmem_V_Bc = load_gmem_V_Bc_offset + load_smem_V_Bc;
-      int load_gmem_V_d = load_smem_V_d;
-      int load_gmem_V_addr =
-          (V_gmem_offset + load_gmem_V_Bc * kHeadDim + load_gmem_V_d);
-      uint32_t load_smem_V_ptr =
-          (smem_V_base_ptr +
-           (kPrefetchVg2sSmemId * V_tile_size +
-            load_gmem_V_Bc * (kHeadDim + kPadV) + load_gmem_V_d) *
-               sizeof(half));
-#pragma unroll
-      for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-        CP_ASYNC_CG(load_smem_V_ptr + i * 2, &V[load_gmem_V_addr + i], 16);
-      }
-      CP_ASYNC_COMMIT_GROUP();
-    }
-
-    // Prefetch next K if applicable
-    if constexpr (kCanPrefetchKVg2s) {
-      if ((active_kv_idx + 1) < num_active_kv_blocks) {
-        // Get next KV block index
-        int next_kv_indices_offset = QKV_batch_id * kv_indices_stride0 +
-                                      QKV_head_id * kv_indices_stride1 +
-                                      Q_tile_id * kv_indices_stride2 +
-                                      (active_kv_idx + 1) * kv_indices_stride3;
-        int next_kv_block_col_idx = kv_indices[next_kv_indices_offset];
-        int next_load_gmem_K_Bc_offset = next_kv_block_col_idx * Bc;
-        
-        int load_gmem_K_Bc = next_load_gmem_K_Bc_offset + load_smem_K_Bc;
-        int load_gmem_K_d = load_smem_K_d;
-        int load_gmem_K_addr =
-            (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
-        uint32_t load_smem_K_ptr =
-            (smem_K_base_ptr +
-             (kPrefetchKg2sSmemId * K_tile_size +
-              load_gmem_K_Bc * (kHeadDim + kPadK) + load_gmem_K_d) *
-                 sizeof(half));
-#pragma unroll
+    if constexpr (!kPrefetchKV) {
+      if (load_row < Bc) {
+        int addr = qkv_offset + (kv_offset + load_row) * kHeadDim + load_col;
+        uint32_t sptr = V_smem_ptr + (load_row * (kHeadDim + kPadV) + load_col) * sizeof(half);
+        #pragma unroll
         for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-          CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
+          CP_ASYNC_CG(sptr + i * 2, &V[addr + i], 16);
         }
         CP_ASYNC_COMMIT_GROUP();
       }
     }
 
-    // Online safe softmax, warp/block reduce max/sum, row wise
-    float lane_row_max_new[kWarpTileSeqLenQ][2];
-    float lane_row_sum_new[kWarpTileSeqLenQ][2];
-    fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_max_new, -INFINITY);
-    fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
-
-    static_assert(kWarpTileSeqLenQ == 1);
-    // Row max for [Br,Bc] tile
-    {
-#pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
-        float tmp_max_0 =
-            __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
-        float tmp_max_1 =
-            __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
-        lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
-        lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
+    // Prefetch next K
+    if constexpr (kPrefetchKV) {
+      if (kv_idx + 1 < num_kv && load_row < Bc) {
+        int next_block = kv_indices[batch_id * kv_indices_stride0 + head_id * kv_indices_stride1 +
+                                     q_tile_id * kv_indices_stride2 + (kv_idx + 1) * kv_indices_stride3];
+        int next_off = next_block * Bc;
+        int addr = qkv_offset + (next_off + load_row) * kHeadDim + load_col;
+        uint32_t sptr = K_smem_ptr + (load_row * (kHeadDim + kPadK) + load_col) * sizeof(half);
+        #pragma unroll
+        for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
+          CP_ASYNC_CG(sptr + i * 2, &K[addr + i], 16);
+        }
+        CP_ASYNC_COMMIT_GROUP();
       }
-
-      lane_row_max_new[0][0] =
-          warp_reduce_max<float, 4>(lane_row_max_new[0][0]);
-      lane_row_max_new[0][1] =
-          warp_reduce_max<float, 4>(lane_row_max_new[0][1]);
     }
 
-    static_assert(kWarpTileSeqLenQ == 1);
-    // Exp sum and mul scale_factor
-    {
-      float block_row_max_new_0 = lane_row_max_new[0][0];
-      float block_row_max_new_1 = lane_row_max_new[0][1];
-      float block_row_max_old_0 = lane_block_row_max_old[0][0];
-      float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
+    // Online softmax: compute per-block row max and exp sum (tile-local),
+    // then later merge with running (m_old, l_old, O_old).
+    float row_max_new[kWarpTileSeqLenQ][2];
+    float row_sum_new[kWarpTileSeqLenQ][2];
+    fill_2D_regs<float, kWarpTileSeqLenQ, 2>(row_max_new, -INFINITY);
+    fill_2D_regs<float, kWarpTileSeqLenQ, 2>(row_sum_new, 0.0f);
 
-#pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
-        float4 t_reg_S_0_1;
-        t_reg_S_0_1.x = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[0]), scale,
-                                         -block_row_max_new_0));
-        t_reg_S_0_1.y = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[1]), scale,
-                                         -block_row_max_new_0));
-        t_reg_S_0_1.z = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[2]), scale,
-                                         -block_row_max_new_1));
-        t_reg_S_0_1.w = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[3]), scale,
-                                         -block_row_max_new_1));
-        lane_row_sum_new[0][0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
-        lane_row_sum_new[0][1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
-        t_hptr_S_0_1[0] = __float2half_rn(t_reg_S_0_1.x);
-        t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
-        t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
-        t_hptr_S_0_1[3] = __float2half_rn(t_reg_S_0_1.w);
-      }
-
-      lane_row_sum_new[0][0] =
-          warp_reduce_sum<float, 4>(lane_row_sum_new[0][0]);
-      lane_row_sum_new[0][1] =
-          warp_reduce_sum<float, 4>(lane_row_sum_new[0][1]);
+    // Row max
+    // For m16n8k16: each thread processes 2 rows (row_0 = lane_id % 8, row_1 = lane_id % 8 + 8)
+    // and 2 columns. For row-wise reduction, we need to reduce across threads with same lane_id % 8
+    // There are 4 threads per row group: lane_id % 8 == 0, 8, 16, 24 for row_0
+    int row_group = lane_id % 8;
+    int base_lane = row_group;
+    
+    #pragma unroll
+    for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+      half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
+      float m0 = __half2float(__hmax(S[0], S[1]));
+      float m1 = __half2float(__hmax(S[2], S[3]));
+      row_max_new[0][0] = fmaxf(row_max_new[0][0], m0);
+      row_max_new[0][1] = fmaxf(row_max_new[0][1], m1);
     }
+    // Row-wise reduction: reduce across threads with same lane_id % 8 (same Q row, different columns)
+    // For m16n8k16: threads with lane_id % 8 == r process the same Q row (for r = 0..7)
+    // There are 4 such threads per row: r, r+8, r+16, r+24
+    // Reduce using shuffle across these 4 threads - get max from all threads in row group
+    int row_base = row_group;  // Base thread for this row group (0-7)
+    float max0 = row_max_new[0][0];
+    float max1 = row_max_new[0][1];
+    // Get values from all other threads in the row group (including base)
+    for (int offset = 0; offset <= 24; offset += 8) {
+      int src_lane = row_base + offset;
+      if (src_lane < WARP_SIZE && src_lane != lane_id) {
+        float val0 = __shfl_sync(0xffffffff, row_max_new[0][0], src_lane, WARP_SIZE);
+        float val1 = __shfl_sync(0xffffffff, row_max_new[0][1], src_lane, WARP_SIZE);
+        max0 = fmaxf(max0, val0);
+        max1 = fmaxf(max1, val1);
+      }
+    }
+    // Broadcast the reduced value from the base thread to all threads in row group
+    row_max_new[0][0] = __shfl_sync(0xffffffff, max0, row_base, WARP_SIZE);
+    row_max_new[0][1] = __shfl_sync(0xffffffff, max1, row_base, WARP_SIZE);
 
-    // Wait for V ready
-    if constexpr (kCanPrefetchKVg2s) {
-      if ((active_kv_idx + 1) < num_active_kv_blocks) {
+    // Exp and sum for this block (tile-local):
+    // Use m_tile = row_max_new as reference, so row_sum_new stores l_tile.
+    float m_tile_0 = row_max_new[0][0];
+    float m_tile_1 = row_max_new[0][1];
+
+    #pragma unroll
+    for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+      half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
+      float4 p;
+      p.x = __expf(__half2float(S[0]) - m_tile_0);
+      p.y = __expf(__half2float(S[1]) - m_tile_0);
+      p.z = __expf(__half2float(S[2]) - m_tile_1);
+      p.w = __expf(__half2float(S[3]) - m_tile_1);
+      row_sum_new[0][0] += p.x + p.y;
+      row_sum_new[0][1] += p.z + p.w;
+      S[0] = __float2half_rn(p.x);
+      S[1] = __float2half_rn(p.y);
+      S[2] = __float2half_rn(p.z);
+      S[3] = __float2half_rn(p.w);
+    }
+    // Row-wise reduction: reduce across threads with same lane_id % 8 (same Q row, different columns)
+    // Sum across the 4 threads in each row group (reuse row_base from above)
+    float sum0 = row_sum_new[0][0];
+    float sum1 = row_sum_new[0][1];
+    // Get values from all other threads in the row group (including base)
+    for (int offset = 0; offset <= 24; offset += 8) {
+      int src_lane = row_base + offset;
+      if (src_lane < WARP_SIZE && src_lane != lane_id) {
+        float val0 = __shfl_sync(0xffffffff, row_sum_new[0][0], src_lane, WARP_SIZE);
+        float val1 = __shfl_sync(0xffffffff, row_sum_new[0][1], src_lane, WARP_SIZE);
+        sum0 += val0;
+        sum1 += val1;
+      }
+    }
+    // Broadcast the reduced value from the base thread to all threads in row group
+    row_sum_new[0][0] = __shfl_sync(0xffffffff, sum0, row_base, WARP_SIZE);
+    row_sum_new[0][1] = __shfl_sync(0xffffffff, sum1, row_base, WARP_SIZE);
+
+    // Wait for V
+    if constexpr (kPrefetchKV) {
+      if (kv_idx + 1 < num_kv) {
         CP_ASYNC_WAIT_GROUP(1);
       } else {
         CP_ASYNC_WAIT_GROUP(0);
@@ -564,195 +569,188 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     }
     __syncthreads();
 
-    // Compute O = P@V
+    // Compute O = P @ V
     fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 2>(R_O, 0);
-#pragma unroll
-    for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
-#pragma unroll
+    #pragma unroll
+    for (int bc = 0; bc < (Bc / kMmaAtomK); ++bc) {
+      #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-        int warp_smem_V_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) +
-                            j * kMmaAtomN;
-        int lane_smem_V_Bc =
-            tile_V_Bc * kMmaAtomK + lane_id % 16;
-        int lane_smem_V_d = warp_smem_V_d;
-        uint32_t lane_smem_V_ptr =
-            (smem_V_base_ptr +
-             (kPrefetchVg2sSmemId * V_tile_size +
-              lane_smem_V_Bc * (kHeadDim + kPadV) + lane_smem_V_d) *
-                 sizeof(half));
-        LDMATRIX_X2_T(R_V[j][0], R_V[j][1], lane_smem_V_ptr);
+        int v_row = bc * kMmaAtomK + lane_id % 16;
+        int v_col = j * kMmaAtomN;
+        int v_buffer_offset = kPrefetchKV ? ((kv_idx & 1) * K_tile_size) : 0;
+        uint32_t ptr = V_smem_ptr + v_buffer_offset + 
+               (v_row * (kHeadDim + kPadV) + v_col) * sizeof(half);
+        LDMATRIX_X2_T(R_V[j][0], R_V[j][1], ptr);
       }
 
-      int w = tile_V_Bc * 2;
-      static_assert(kWarpTileSeqLenP == 1);
-      {
-#pragma unroll
-        for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-          HMMA16816(R_O[0][j][0], R_O[0][j][1], R_S[0][w][0], R_S[0][w][1],
-                    R_S[0][w + 1][0], R_S[0][w + 1][1], R_V[j][0], R_V[j][1],
-                    R_O[0][j][0], R_O[0][j][1]);
-        }
+      int w = bc * 2;
+      #pragma unroll
+      for (int j = 0; j < kWarpTileHeadDimV; ++j) {
+        HMMA16816(R_O[0][j][0], R_O[0][j][1],
+                  R_S[0][w][0], R_S[0][w][1], R_S[0][w + 1][0], R_S[0][w + 1][1],
+                  R_V[j][0], R_V[j][1], R_O[0][j][0], R_O[0][j][1]);
       }
     }
     __syncthreads();
 
-    // Rescale O
-    static_assert(kWarpTileSeqLenP == 1);
-    {
-      float block_row_max_new_0 = lane_row_max_new[0][0];
-      float block_row_max_new_1 = lane_row_max_new[0][1];
-      float block_row_sum_new_0 = lane_row_sum_new[0][0];
-      float block_row_sum_new_1 = lane_row_sum_new[0][1];
-      float block_row_max_old_0 = lane_block_row_max_old[0][0];
-      float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
-      block_row_max_old_0 =
-          (active_kv_idx > 0 ? block_row_max_old_0 : block_row_max_new_0);
-      block_row_max_old_1 =
-          (active_kv_idx > 0 ? block_row_max_old_1 : block_row_max_new_1);
+    // Rescale O with online softmax correction.
+    // We have:
+    //   - tile-local max m_tile_{0,1} and sums row_sum_new (l_tile)
+    //   - running state row_max_old (m_old) and row_sum_old (l_old)
+    // We compute:
+    //   m_new = max(m_old, m_tile)
+    //   alpha = exp(m_old - m_new)
+    //   beta  = exp(m_tile - m_new)
+    //   l_new = alpha * l_old + beta * l_tile
+    //   O_new = alpha * O_old + beta * O_tile
+    float l_old_0 = row_sum_old[0][0];
+    float l_old_1 = row_sum_old[0][1];
+    float l_tile_0 = row_sum_new[0][0];
+    float l_tile_1 = row_sum_new[0][1];
 
-      float rescale_o_factor_0 =
-          __expf(block_row_max_old_0 - block_row_max_new_0);
-      float rescale_o_factor_1 =
-          __expf(block_row_max_old_1 - block_row_max_new_1);
+    float m_old_0 = row_max_old[0][0];
+    float m_old_1 = row_max_old[0][1];
 
-#pragma unroll
-      for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-        half *t_hptr_O_0_1 = reinterpret_cast<half *>(&(R_O[0][j][0]));
-        if constexpr (kOStorageAccFloat32) {
-          float *t_fptr_D_0_1 = reinterpret_cast<float *>(&(R_D[0][j][0]));
-          t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[0],
-                                      __half2float(t_hptr_O_0_1[0]));
-          t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[1],
-                                      __half2float(t_hptr_O_0_1[1]));
-          t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[2],
-                                      __half2float(t_hptr_O_0_1[2]));
-          t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[3],
-                                      __half2float(t_hptr_O_0_1[3]));
-        } else {
-          half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-          t_hptr_D_0_1[0] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[0]),
-                        __half2float(t_hptr_O_0_1[0])));
-          t_hptr_D_0_1[1] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[1]),
-                        __half2float(t_hptr_O_0_1[1])));
-          t_hptr_D_0_1[2] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[2]),
-                        __half2float(t_hptr_O_0_1[2])));
-          t_hptr_D_0_1[3] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[3]),
-                        __half2float(t_hptr_O_0_1[3])));
-        }
-      }
+    float m_new_0;
+    float m_new_1;
+    float alpha_0, beta_0;
+    float alpha_1, beta_1;
 
-      float block_row_sum_old_0 = lane_block_row_sum_old[0][0];
-      float block_row_sum_old_1 = lane_block_row_sum_old[0][1];
-      lane_block_row_sum_old[0][0] = (__fmaf_rn(
-          rescale_o_factor_0, block_row_sum_old_0, block_row_sum_new_0));
-      lane_block_row_sum_old[0][1] = (__fmaf_rn(
-          rescale_o_factor_1, block_row_sum_old_1, block_row_sum_new_1));
-      lane_block_row_max_old[0][0] = block_row_max_new_0;
-      lane_block_row_max_old[0][1] = block_row_max_new_1;
+    // Row group 0
+    if (l_old_0 == 0.0f) {
+      // No previous contributions
+      m_new_0 = m_tile_0;
+      alpha_0 = 0.0f;
+      beta_0 = 1.0f;
+    } else if (l_tile_0 == 0.0f) {
+      // No contributions from this tile
+      m_new_0 = m_old_0;
+      alpha_0 = 1.0f;
+      beta_0 = 0.0f;
+    } else {
+      m_new_0 = fmaxf(m_old_0, m_tile_0);
+      alpha_0 = __expf(m_old_0 - m_new_0);
+      beta_0  = __expf(m_tile_0 - m_new_0);
     }
 
-    if constexpr (kCanPrefetchKVg2s) {
-      if ((active_kv_idx + 1) < num_active_kv_blocks) {
+    // Row group 1
+    if (l_old_1 == 0.0f) {
+      m_new_1 = m_tile_1;
+      alpha_1 = 0.0f;
+      beta_1 = 1.0f;
+    } else if (l_tile_1 == 0.0f) {
+      m_new_1 = m_old_1;
+      alpha_1 = 1.0f;
+      beta_1 = 0.0f;
+    } else {
+      m_new_1 = fmaxf(m_old_1, m_tile_1);
+      alpha_1 = __expf(m_old_1 - m_new_1);
+      beta_1  = __expf(m_tile_1 - m_new_1);
+    }
+
+    #pragma unroll
+    for (int j = 0; j < kWarpTileHeadDimV; ++j) {
+      half *O = reinterpret_cast<half *>(&R_O[0][j][0]);
+      if constexpr (kOStorageAccFloat32) {
+        float *D = reinterpret_cast<float *>(&R_D[0][j][0]);
+        D[0] = __fmaf_rn(alpha_0, D[0], beta_0 * __half2float(O[0]));
+        D[1] = __fmaf_rn(alpha_0, D[1], beta_0 * __half2float(O[1]));
+        D[2] = __fmaf_rn(alpha_1, D[2], beta_1 * __half2float(O[2]));
+        D[3] = __fmaf_rn(alpha_1, D[3], beta_1 * __half2float(O[3]));
+      } else {
+        half *D = reinterpret_cast<half *>(&R_D[0][j][0]);
+        D[0] = __float2half_rn(__fmaf_rn(alpha_0, __half2float(D[0]),
+                                         beta_0 * __half2float(O[0])));
+        D[1] = __float2half_rn(__fmaf_rn(alpha_0, __half2float(D[1]),
+                                         beta_0 * __half2float(O[1])));
+        D[2] = __float2half_rn(__fmaf_rn(alpha_1, __half2float(D[2]),
+                                         beta_1 * __half2float(O[2])));
+        D[3] = __float2half_rn(__fmaf_rn(alpha_1, __half2float(D[3]),
+                                         beta_1 * __half2float(O[3])));
+      }
+    }
+
+    // Update running l and m
+    row_sum_old[0][0] = alpha_0 * l_old_0 + beta_0 * l_tile_0;
+    row_sum_old[0][1] = alpha_1 * l_old_1 + beta_1 * l_tile_1;
+    row_max_old[0][0] = m_new_0;
+    row_max_old[0][1] = m_new_1;
+
+    if constexpr (kPrefetchKV) {
+      if (kv_idx + 1 < num_kv) {
         CP_ASYNC_WAIT_GROUP(0);
         __syncthreads();
       }
     }
-
-  } // end loop over active KV blocks
+  }
   __syncthreads();
 
-  // Final rescale
-  static_assert(kWarpTileSeqLenP == 1);
-  {
-    float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0][0]);
-    float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[0][1]);
-#pragma unroll
-    for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-      if constexpr (kOStorageAccFloat32) {
-        float *t_fptr_D_0_1 = reinterpret_cast<float *>(&(R_D[0][j][0]));
-        half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[0]);
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[1]);
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[2]);
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[3]);
-      } else {
-        half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-        t_hptr_D_0_1[0] =
-            __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[0]));
-        t_hptr_D_0_1[1] =
-            __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[1]));
-        t_hptr_D_0_1[2] =
-            __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
-        t_hptr_D_0_1[3] =
-            __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
-      }
+  // Final rescale by 1/sum (with safety check for zero sum)
+  float inv_sum_0 = (row_sum_old[0][0] > 0.0f) ? __frcp_rn(row_sum_old[0][0]) : 0.0f;
+  float inv_sum_1 = (row_sum_old[0][1] > 0.0f) ? __frcp_rn(row_sum_old[0][1]) : 0.0f;
+  
+  #pragma unroll
+  for (int j = 0; j < kWarpTileHeadDimV; ++j) {
+    if constexpr (kOStorageAccFloat32) {
+      float *D = reinterpret_cast<float *>(&R_D[0][j][0]);
+      half *H = reinterpret_cast<half *>(&R_D[0][j][0]);
+      H[0] = __float2half_rn(inv_sum_0 * D[0]);
+      H[1] = __float2half_rn(inv_sum_0 * D[1]);
+      H[2] = __float2half_rn(inv_sum_1 * D[2]);
+      H[3] = __float2half_rn(inv_sum_1 * D[3]);
+    } else {
+      half *D = reinterpret_cast<half *>(&R_D[0][j][0]);
+      D[0] = __float2half_rn(inv_sum_0 * __half2float(D[0]));
+      D[1] = __float2half_rn(inv_sum_0 * __half2float(D[1]));
+      D[2] = __float2half_rn(inv_sum_1 * __half2float(D[2]));
+      D[3] = __float2half_rn(inv_sum_1 * __half2float(D[3]));
     }
   }
 
-  // Store O
-  static_assert(kWarpTileSeqLenP == 1);
-  {
-#pragma unroll
-    for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-      if constexpr (kCanPrefetchQs2r && kNumPrefetchQs2r > 1) {
-        R_Q[0][0][0] = R_D[0][j][0];
-        R_Q[1][0][0] = R_D[0][j][1];
-        R_Q[0][0][1] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 1, 4);
-        R_Q[0][0][2] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 2, 4);
-        R_Q[0][0][3] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 3, 4);
-        R_Q[1][0][1] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 1, 4);
-        R_Q[1][0][2] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 2, 4);
-        R_Q[1][0][3] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 3, 4);
-        if (lane_id % 4 == 0) {
-          int store_warp_regs_O_Br =
-              warp_QP * (kMmaAtomM * kWarpTileSeqLenP) + 0 * kMmaAtomM;
-          int store_lane_gmem_O_Br =
-              O_tile_id * Br + store_warp_regs_O_Br + lane_id / 4;
-          int store_warp_regs_O_d =
-              warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
-          int store_lane_gmem_O_d = store_warp_regs_O_d;
-          int store_gmem_O_addr_0 =
-              (O_gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim +
-               store_lane_gmem_O_d);
-          int store_gmem_O_addr_1 =
-              (O_gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim +
-               store_lane_gmem_O_d);
-          LDST128BITS(O[store_gmem_O_addr_0]) = LDST128BITS(R_Q[0][0][0]);
-          LDST128BITS(O[store_gmem_O_addr_1]) = LDST128BITS(R_Q[1][0][0]);
-        }
-      } else {
-        uint32_t R_Z[2][4];
-        R_Z[0][0] = R_D[0][j][0];
-        R_Z[1][0] = R_D[0][j][1];
-        R_Z[0][1] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 1, 4);
-        R_Z[0][2] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 2, 4);
-        R_Z[0][3] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 3, 4);
-        R_Z[1][1] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 1, 4);
-        R_Z[1][2] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 2, 4);
-        R_Z[1][3] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 3, 4);
-        if (lane_id % 4 == 0) {
-          int store_warp_regs_O_Br =
-              warp_QP * (kMmaAtomM * kWarpTileSeqLenP) + 0 * kMmaAtomM;
-          int store_lane_gmem_O_Br =
-              O_tile_id * Br + store_warp_regs_O_Br + lane_id / 4;
-          int store_warp_regs_O_d =
-              warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
-          int store_lane_gmem_O_d = store_warp_regs_O_d;
-          int store_gmem_O_addr_0 =
-              (O_gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim +
-               store_lane_gmem_O_d);
-          int store_gmem_O_addr_1 =
-              (O_gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim +
-               store_lane_gmem_O_d);
-          LDST128BITS(O[store_gmem_O_addr_0]) = LDST128BITS(R_Z[0][0]);
-          LDST128BITS(O[store_gmem_O_addr_1]) = LDST128BITS(R_Z[1][0]);
-        }
+  // Store O: for simplicity and correctness, each thread writes its own
+  // four output elements directly to global memory based on the known
+  // MMA m16n8k16 fragment layout.
+  //
+  // Layout reminder:
+  // - Each thread holds 2 rows: row_0 = lane_id % 8, row_1 = row_0 + 8
+  // - Each thread holds 2 cols per row:
+  //     col_pair = (lane_id / 8) * 2  (0, 2, 4, or 6)
+  //     cols are (col_pair, col_pair + 1)
+  // - Column groups of 8 come from j * kMmaAtomN (j-th head-dim tile).
+  //
+  // This is not the most coalesced pattern but is much easier to reason
+  // about and is sufficient for a high-performance baseline.
+  #pragma unroll
+  for (int j = 0; j < kWarpTileHeadDimV; ++j) {
+    half *D = reinterpret_cast<half *>(&R_D[0][j][0]);
+
+    int row_in_tile = lane_id % 8;
+    int row0 = q_tile_id * Br + warp_QP * kMmaAtomM + row_in_tile;
+    int row1 = row0 + 8;
+
+    int col_pair = (lane_id / 8) * 2;  // 0, 2, 4, or 6
+    int col0 = j * kMmaAtomN + col_pair;
+    int col1 = col0 + 1;
+
+    if (row0 < QKV_seqlen) {
+      if (col0 < kHeadDim) {
+        int addr = qkv_offset + row0 * kHeadDim + col0;
+        O[addr] = D[0];
+      }
+      if (col1 < kHeadDim) {
+        int addr = qkv_offset + row0 * kHeadDim + col1;
+        O[addr] = D[1];
+      }
+    }
+
+    if (row1 < QKV_seqlen) {
+      if (col0 < kHeadDim) {
+        int addr = qkv_offset + row1 * kHeadDim + col0;
+        O[addr] = D[2];
+      }
+      if (col1 < kHeadDim) {
+        int addr = qkv_offset + row1 * kHeadDim + col1;
+        O[addr] = D[3];
       }
     }
   }
@@ -763,69 +761,51 @@ void launch_omni_attn_mma_stages_split_q_shared_kv(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
     torch::Tensor block_mask_types) {
-  constexpr int kMmaAtomM = 16;
-  constexpr int kMmaAtomN = 8;
-  constexpr int kMmaAtomK = 16;
-#ifdef BUILD_FLASH_ATTN_MMA_L20
-  constexpr int kMmaTileSeqLenQ = 4;
-  constexpr int kMmaTileSeqLenK = 1;
-  constexpr int kMmaTileSeqLenP = 4;
-  constexpr int kMmaTileHeadDimV = 1;
-  constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kStage > 1) ? 4 : 8;
-  constexpr int kWarpTileSeqLenP = 1;
-#else
+  
+  constexpr int kMmaAtomM = 16, kMmaAtomN = 8, kMmaAtomK = 16;
   constexpr int kMmaTileSeqLenQ = (kHeadDim < 128) ? 8 : 8;
   constexpr int kMmaTileSeqLenK = 1;
-  constexpr int kMmaTileSeqLenP = (kHeadDim < 128) ? 8 : 8;
+  constexpr int kMmaTileSeqLenP = kMmaTileSeqLenQ;
   constexpr int kMmaTileHeadDimV = 1;
   constexpr int kWarpTileSeqLenQ = 1;
-  constexpr int kWarpTileSeqLenK = (kHeadDim < 128) ? 8 : 4;
+  // For head_dim <= 64, use kWarpTileSeqLenK = 16 so that:
+  //   Br = 128, Bc = 128, matching BLOCK_SIZE used by the Python block mask.
+  // For larger head_dim we keep the previous settings (but we currently
+  // only enable the MMA path for head_dim <= 64 in the wrapper).
+  constexpr int kWarpTileSeqLenK =
+      (kHeadDim <= 64 ? 16 : (kHeadDim < 128 ? 8 : 4));
   constexpr int kWarpTileSeqLenP = 1;
-#endif
-  constexpr int kWarpTileHeadDimV =
-      (kHeadDim / (kMmaAtomN * kMmaTileHeadDimV));
-  constexpr int Br =
-      kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
-  constexpr int Bc =
-      kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
-  constexpr int kNumThreads =
-      WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-  constexpr int kPadQ = 8;
-  constexpr int kPadK = 8;
-  constexpr int kPadV = 8;
+  constexpr int kWarpTileHeadDimV = kHeadDim / (kMmaAtomN * kMmaTileHeadDimV);
+  constexpr int kPadQ = 8, kPadK = 8, kPadV = 8;
   constexpr int kOStorageAccFloat32 = (kHeadDim < 256) ? 1 : 0;
 
-  constexpr int Q_tile_size = (Br * (kHeadDim + kPadQ));
-  constexpr int K_tile_size = (Bc * (kHeadDim + kPadK));
-  constexpr int V_tile_size = (Bc * (kHeadDim + kPadV));
-  const int smem_max_size =
-      (Q_tile_size + kStage * max(K_tile_size, V_tile_size)) * sizeof(half);
+  constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
+  constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
+  constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
 
-  const int QKV_batch = Q.size(0);
-  const int QKV_head = Q.size(1);
-  const int QKV_seqlen = Q.size(2);
-  const int num_q_blocks = (QKV_seqlen + Br - 1) / Br;
-  const int max_blocks = kv_indices.size(3);
+  constexpr int Q_size = Br * (kHeadDim + kPadQ);
+  constexpr int KV_size = Bc * (kHeadDim + kPadK);
+  const int smem_size = (Q_size + kStage * KV_size) * sizeof(half);
 
-  dim3 grid(div_ceil(QKV_seqlen, Br), QKV_batch * QKV_head);
+  const int batch = Q.size(0), heads = Q.size(1), seqlen = Q.size(2);
+
+  dim3 grid(div_ceil(seqlen, Br), batch * heads);
   dim3 block(kNumThreads);
 
   cudaFuncSetAttribute(
       omni_attn_mma_stages_split_q_shared_kv_kernel<
-          kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
-          kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ,
-          kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+          kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      98304);
+      cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
 
   omni_attn_mma_stages_split_q_shared_kv_kernel<
-      kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK, kMmaTileSeqLenQ,
-      kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV, kWarpTileSeqLenQ,
-      kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+      kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+      kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
       kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
-      <<<grid, block, smem_max_size>>>(
+      <<<grid, block, smem_size>>>(
           reinterpret_cast<half *>(Q.data_ptr()),
           reinterpret_cast<half *>(K.data_ptr()),
           reinterpret_cast<half *>(V.data_ptr()),
@@ -833,11 +813,11 @@ void launch_omni_attn_mma_stages_split_q_shared_kv(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          QKV_seqlen, QKV_head, QKV_batch, num_q_blocks, max_blocks,
-          kv_num_blocks.stride(0), kv_num_blocks.stride(1),
-          kv_num_blocks.stride(2), kv_indices.stride(0), kv_indices.stride(1),
-          kv_indices.stride(2), kv_indices.stride(3),
-          block_mask_types.stride(0), block_mask_types.stride(1),
+          seqlen, heads, batch,
+          div_ceil(seqlen, Br), kv_indices.size(3),
+          kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
+          kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
+          block_mask_types.stride(0), block_mask_types.stride(1), 
           block_mask_types.stride(2), block_mask_types.stride(3));
 }
 
@@ -849,56 +829,85 @@ void omni_attn_mma_stages_split_q_shared_kv(
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
-  const int d = Q.size(3);
 
-  if (stages > 1) {
-    switch (d) {
-    case 32:
-      launch_omni_attn_mma_stages_split_q_shared_kv<32, 2>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 64:
-      launch_omni_attn_mma_stages_split_q_shared_kv<64, 2>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 96:
-      launch_omni_attn_mma_stages_split_q_shared_kv<96, 2>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 128:
-      launch_omni_attn_mma_stages_split_q_shared_kv<128, 2>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    default:
-      throw std::runtime_error("headdim not support!");
-      break;
-    }
-  } else {
-    switch (d) {
-    case 32:
-      launch_omni_attn_mma_stages_split_q_shared_kv<32, 1>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 64:
-      launch_omni_attn_mma_stages_split_q_shared_kv<64, 1>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 96:
-      launch_omni_attn_mma_stages_split_q_shared_kv<96, 1>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 128:
-      launch_omni_attn_mma_stages_split_q_shared_kv<128, 1>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    case 256:
-      launch_omni_attn_mma_stages_split_q_shared_kv<256, 1>(
-          Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types);
-      break;
-    default:
-      throw std::runtime_error("headdim not support!");
-      break;
-    }
-  }
+  const int batch = Q.size(0);
+  const int heads = Q.size(1);
+  const int seqlen = Q.size(2);
+  const int head_dim = Q.size(3);
+
+  // For now, always use the simple correctness-first kernel. The optimized
+  // MMA kernel above is kept for future work, but is not invoked until its
+  // correctness is fully validated.
+  const int num_q_blocks = kv_num_blocks.size(2);
+  const int max_blocks = kv_indices.size(3);
+
+  const int total_q = batch * heads * seqlen;
+  const int threads = 128;
+  const int blocks = div_ceil(total_q, threads);
+
+  omni_attn_simple_kernel<<<blocks, threads>>>(
+      reinterpret_cast<half *>(Q.data_ptr()),
+      reinterpret_cast<half *>(K.data_ptr()),
+      reinterpret_cast<half *>(V.data_ptr()),
+      reinterpret_cast<half *>(O.data_ptr()),
+      reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
+      reinterpret_cast<int *>(kv_indices.data_ptr()),
+      reinterpret_cast<int *>(block_mask_types.data_ptr()),
+      seqlen,
+      heads,
+      batch,
+      num_q_blocks,
+      max_blocks,
+      kv_num_blocks.stride(0),
+      kv_num_blocks.stride(1),
+      kv_num_blocks.stride(2),
+      kv_indices.stride(0),
+      kv_indices.stride(1),
+      kv_indices.stride(2),
+      kv_indices.stride(3),
+      block_mask_types.stride(0),
+      block_mask_types.stride(1),
+      block_mask_types.stride(2),
+      block_mask_types.stride(3),
+      head_dim);
 }
 
+// MMA-only entry point for debugging/benchmarking.
+// This does not affect the main simple kernel used in tests.
+void omni_attn_mma_stages_split_q_shared_kv_mma_only(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
+    torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
+    torch::Tensor block_mask_types, int stages) {
+  CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
+  CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
+  CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)
+  CHECK_TORCH_TENSOR_DTYPE(O, torch::kHalf)
+
+  const int head_dim = Q.size(3);
+
+#define LAUNCH(D, S)                                                             \
+  launch_omni_attn_mma_stages_split_q_shared_kv<D, S>(                          \
+      Q, K, V, O, kv_num_blocks, kv_indices, block_mask_types)
+
+  if (stages > 1) {
+    switch (head_dim) {
+      case 32: LAUNCH(32, 2); break;
+      case 64: LAUNCH(64, 2); break;
+      case 128: LAUNCH(128, 2); break;
+      default:
+        throw std::runtime_error("headdim not supported for MMA-only kernel");
+    }
+  } else {
+    switch (head_dim) {
+      case 32: LAUNCH(32, 1); break;
+      case 64: LAUNCH(64, 1); break;
+      case 96: LAUNCH(96, 1); break;
+      case 128: LAUNCH(128, 1); break;
+      case 256: LAUNCH(256, 1); break;
+      default:
+        throw std::runtime_error("headdim not supported for MMA-only kernel");
+    }
+  }
+
+#undef LAUNCH
+}
