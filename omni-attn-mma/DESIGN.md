@@ -1,132 +1,329 @@
 # Omni-Attention Design Document
 
-## Overview
+``` python
+# OmniAttention-MMA blockmask implementation(shared KV)
+# ============================================================================
+# Kernel Arguments Design
+# ============================================================================
+# Input tensors:
+#   Q: [batch, nheads, seqlen, head_dim] - Query tensor
+#   K: [batch, nheads, seqlen, head_dim] - Key tensor  
+#   V: [batch, nheads, seqlen, head_dim] - Value tensor
+#
+# Output tensor:
+#   O: [batch, nheads, seqlen, head_dim] - Output tensor
+#
+# Block mask metadata (sparse format):
+#   kv_num_blocks: [batch, nheads, num_q_blocks] - int32
+#                  Number of active KV blocks for each Q block
+#   kv_indices: [batch, nheads, num_q_blocks, max_blocks] - int32
+#               KV block indices to process (0-indexed, relative to KV sequence)
+#   block_mask_types: [batch, nheads, num_q_blocks, max_blocks] - int32
+#                     Mask type per block: 0=MASKED, 1=CAUSAL, 2=FULL, 3=PARTIAL
+#
+# Stride information (for flexible tensor layouts):
+#   kv_num_blocks_stride[0,1,2]: strides for batch, head, q_block dimensions
+#   kv_indices_stride[0,1,2,3]: strides for batch, head, q_block, kv_idx dimensions
+#   block_mask_types_stride[0,1,2,3]: same as kv_indices_stride
+#
+# Dimensions:
+#   seqlen: Sequence length (Q and KV have same length in shared KV case)
+#   head_dim: Head dimension (32, 64, 96, 128, 256)
+#   BLOCK_SIZE: Block size used in block mask (typically 128, must be >= Bc)
+#   num_q_blocks: Number of Q blocks = ceil(seqlen / BLOCK_SIZE)
+#   max_blocks: Maximum number of active KV blocks per Q block
+#
+# Grid/Block configuration:
+#   grid.x = num_q_blocks
+#   grid.y = batch * nheads
+#   block.x = kNumThreads (e.g., 128 for 4 warps)
+#
+# Template parameters (compile-time):
+#   kHeadDim: Head dimension
+#   kStage: Pipeline stage (1=no prefetch, 2=with prefetch)
+#   kMmaAtomM, kMmaAtomN, kMmaAtomK: MMA atom sizes (16, 8, 16)
+#   kMmaTileSeqLenQ, kMmaTileSeqLenK: MMA tile sizes
+#   kWarpTileSeqLenQ, kWarpTileSeqLenK: Warp tile sizes
+#   Br: Q block size = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ
+#   Bc: KV tile size = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK
 
-Omni-Attention combines the best of both worlds:
-- **FlashAttention-2's split-Q strategy**: Efficient tiling with online softmax to avoid materializing the full attention matrix
-- **FlexAttention's block_mask**: Block-sparse attention with per-block mask types
+# ============================================================================
+# Stage 1: Load Q Block (load once, reuse for all KV blocks)
+# ============================================================================
+# Get block indices
+batch_id = blockIdx.y / nheads
+head_id = blockIdx.y % nheads
+q_block_id = blockIdx.x  # [0, num_q_blocks)
 
-## Key Design Decisions
+# Compute Q block boundaries
+q_block_start = q_block_id * BLOCK_SIZE
+q_block_end = min(q_block_start + BLOCK_SIZE, seqlen)
+q_tile_start = q_block_start  # Q tile aligned with Q block in this design
+q_tile_end = min(q_tile_start + Br, seqlen)
 
-### 1. Block Mask Types
+# Load Q block from global memory to shared memory
+async_copy_Q_g2s():
+    for each thread:
+        q_row = thread_mapped_row  # Within Br
+        q_col = thread_mapped_col  # Within head_dim
+        if (q_tile_start + q_row) < q_tile_end:
+            gmem_addr = Q_gmem_offset + (q_tile_start + q_row) * head_dim + q_col
+            smem_addr = smem_Q_base + q_row * (head_dim + padQ) + q_col
+            CP_ASYNC_CG(smem_addr, gmem_addr, 16 bytes)
+    CP_ASYNC_COMMIT_GROUP()
+    CP_ASYNC_WAIT_GROUP(0)
+    __syncthreads()
 
-Each block in the attention matrix can have one of three types:
+# Initialize online softmax statistics (per Q row)
+row_max_old = -infinity  # Running max per row
+row_sum_old = 0.0        # Running sum of exp per row
+O_global = zeros([Br, head_dim])  # Accumulated output per row
 
-- **MASKED (0)**: Block is fully masked out - skip computation entirely
-- **CAUSAL (1)**: Block uses causal masking (q_idx >= kv_idx)
-- **FULL (2)**: Block has no masking - full attention
+# ============================================================================
+# Stage 2: Iterate over Active KV Blocks (from block mask)
+# ============================================================================
+# Get number of active KV blocks for this Q block
+num_kv_blocks = kv_num_blocks[
+    batch_id * kv_num_blocks_stride0 +
+    head_id * kv_num_blocks_stride1 +
+    q_block_id * kv_num_blocks_stride2
+]
 
-### 2. Split-Q Strategy (from FlashAttention-2)
+# Outer loop: iterate over active KV blocks
+for kv_idx in range(0, num_kv_blocks):
+    
+    # Get KV block index and mask type
+    kv_block_idx_off = (
+        batch_id * kv_indices_stride0 +
+        head_id * kv_indices_stride1 +
+        q_block_id * kv_indices_stride2 +
+        kv_idx * kv_indices_stride3
+    )
+    kv_block = kv_indices[kv_block_idx_off]  # KV block index (0-indexed)
+    
+    mask_type_off = (
+        batch_id * block_mask_types_stride0 +
+        head_id * block_mask_types_stride1 +
+        q_block_id * block_mask_types_stride2 +
+        kv_idx * block_mask_types_stride3
+    )
+    mask_type = block_mask_types[mask_type_off]
+    
+    # Skip fully masked blocks
+    if mask_type == MASKED:
+        continue
+    
+    # Compute KV block boundaries (in sequence indices)
+    kv_block_start = kv_block * BLOCK_SIZE
+    kv_block_end = min(kv_block_start + BLOCK_SIZE, seqlen)
+    
+    # Determine which tiles within this KV block to process
+    # A KV block may span multiple tiles if BLOCK_SIZE > Bc
+    first_tile = kv_block_start // Bc  # First tile index
+    last_tile = (kv_block_end + Bc - 1) // Bc  # Last tile index (exclusive)
+    
+    # Inner loop: iterate over tiles within this KV block
+    for tile_K_seqlen in range(first_tile, last_tile):
+        
+        # Compute tile boundaries
+        tile_kv_start = tile_K_seqlen * Bc
+        tile_kv_end = min(tile_kv_start + Bc, seqlen)
+        
+        # Determine effective KV range for this tile (may be partial)
+        effective_kv_start = max(tile_kv_start, kv_block_start)
+        effective_kv_end = min(tile_kv_end, kv_block_end)
+        
+        # Check if this tile is fully within the KV block
+        is_full_tile = (tile_kv_start >= kv_block_start and 
+                       tile_kv_end <= kv_block_end)
+        
+        # ========== 2.1 Load K Tile ==========
+        async_copy_K_g2s():
+            for each thread:
+                k_row = thread_mapped_row  # Within Bc
+                k_col = thread_mapped_col  # Within head_dim
+                kv_idx_abs = tile_kv_start + k_row
+                if kv_idx_abs < tile_kv_end:
+                    gmem_addr = K_gmem_offset + kv_idx_abs * head_dim + k_col
+                    smem_addr = smem_K_base + k_row * (head_dim + padK) + k_col
+                    CP_ASYNC_CG(smem_addr, gmem_addr, 16 bytes)
+        CP_ASYNC_COMMIT_GROUP()
+        CP_ASYNC_WAIT_GROUP(0)
+        __syncthreads()
+        
+        # ========== 2.2 Compute S = Q @ K^T (with mask application) ==========
+        R_S = zeros([Br, Bc])  # Score matrix in registers
+        
+        for tile_K_d in range(0, head_dim / kMmaAtomK):
+            # Load Q from smem to registers (m16k16)
+            load_Q_s2r(R_Q, smem_Q, tile_K_d, warp_QP)
+            
+            # Load K from smem to registers (k16n8)
+            load_K_s2r(R_K, smem_K, tile_K_d, warp_KV)
+            
+            # MMA computation: R_S += R_Q @ R_K^T (m16n8k16)
+            for j in range(kWarpTileSeqLenK):
+                HMMA16816(R_S[0][j], R_Q, R_K[j], R_S[0][j])
+        
+        __syncthreads()
+        
+        # ========== 2.3 Apply Block Mask to S Matrix ==========
+        # Apply mask based on mask_type and tile boundaries
+        for q_row_local in range(0, Br):
+            q_idx_abs = q_tile_start + q_row_local
+            if q_idx_abs >= q_tile_end:
+                continue
+            
+            for kv_col_local in range(0, Bc):
+                kv_idx_abs = tile_kv_start + kv_col_local
+                
+                # Skip if outside effective KV range
+                if kv_idx_abs < effective_kv_start or kv_idx_abs >= effective_kv_end:
+                    R_S[q_row_local][kv_col_local] = -infinity
+                    continue
+                
+                # Apply mask based on type
+                if mask_type == FULL:
+                    # No masking needed
+                    pass
+                elif mask_type == CAUSAL:
+                    # Causal mask: q_idx >= kv_idx
+                    if q_idx_abs < kv_idx_abs:
+                        R_S[q_row_local][kv_col_local] = -infinity
+                elif mask_type == PARTIAL:
+                    # Partial mask: handle cross-boundary cases
+                    # This requires additional metadata or computation
+                    # For now, treat as CAUSAL if crossing boundary
+                    if not is_full_tile:
+                        # Check if this position should be masked
+                        # (Implementation depends on partial mask definition)
+                        if should_mask_partial(q_idx_abs, kv_idx_abs, 
+                                             q_block_start, q_block_end,
+                                             kv_block_start, kv_block_end):
+                            R_S[q_row_local][kv_col_local] = -infinity
+        
+        # ========== 2.4 Load V Tile ==========
+        async_copy_V_g2s():
+            for each thread:
+                v_row = thread_mapped_row  # Within Bc
+                v_col = thread_mapped_col  # Within head_dim
+                kv_idx_abs = tile_kv_start + v_row
+                if kv_idx_abs < tile_kv_end:
+                    gmem_addr = V_gmem_offset + kv_idx_abs * head_dim + v_col
+                    smem_addr = smem_V_base + v_row * (head_dim + padV) + v_col
+                    CP_ASYNC_CG(smem_addr, gmem_addr, 16 bytes)
+        CP_ASYNC_COMMIT_GROUP()
+        CP_ASYNC_WAIT_GROUP(0)
+        __syncthreads()
+        
+        # ========== 2.5 Online Softmax: Compute P = softmax(S) ==========
+        # 2.5.1 Compute row max (with mask applied)
+        row_max_new = reduce_max(R_S * scale)  # Thread -> Warp -> Block reduce
+        row_max_global = max(row_max_old, row_max_new)
+        
+        # 2.5.2 Compute exp and row sum
+        P = exp(R_S * scale - row_max_global)  # Update R_S to P
+        row_sum_new = reduce_sum(P)  # Thread -> Warp -> Block reduce
+        
+        # ========== 2.6 Compute O_partial = P @ V ==========
+        R_O = zeros([Br, head_dim])  # Current tile output
+        
+        for tile_V_Bc in range(0, Bc / kMmaAtomK):
+            # Load V from smem to registers (k16n8, transposed)
+            load_V_s2r_trans(R_V, smem_V, tile_V_Bc, warp_KV)
+            
+            # MMA computation: R_O += P[:, Bc_slice] @ V[Bc_slice, :]
+            w = tile_V_Bc * 2  # Select P column block
+            for j in range(kWarpTileHeadDimV):
+                HMMA16816(R_O[0][j], R_S[0][w], R_S[0][w+1], R_V[j], R_O[0][j])
+        
+        __syncthreads()
+        
+        # ========== 2.7 Online Rescaling (FlashAttention-2 core) ==========
+        rescale_factor = exp(row_max_old - row_max_global)
+        
+        # Rescale old output and accumulate new output
+        O_global = rescale_factor * O_global + R_O
+        
+        # Update statistics
+        row_sum_global = rescale_factor * row_sum_old + row_sum_new
+        row_max_old = row_max_global
+        row_sum_old = row_sum_global
 
-- Split Q into blocks of size `BLOCK_M` (typically 128)
-- For each Q block, iterate over KV blocks specified by `BlockMask`
-- Use online softmax with tiling to avoid materializing full S = Q@K^T matrix
-- Maintain running statistics (m_i, lse_i) for numerical stability
+# ============================================================================
+# Stage 3: Final Normalization and Write Back
+# ============================================================================
+# Final rescale: O_final = O_global / row_sum_global
+rescale_factor_final = 1.0 / row_sum_global
+O_final = O_global * rescale_factor_final
 
-### 3. BlockMask Format (from FlexAttention)
+# Write back to global memory (collective store with warp shuffle)
+collective_store_O_gmem(O_final, O_gmem_offset, q_tile_start)
 
-- `kv_num_blocks`: [batch, nheads, num_q_blocks] - number of active KV blocks per Q block
-- `kv_indices`: [batch, nheads, num_q_blocks, max_blocks] - which KV block columns to process
-- `block_mask_types`: [batch, nheads, num_q_blocks, max_blocks] - mask type per block
-
-## Implementation Details
-
-### Kernel Structure
-
-```
-For each Q block (start_m):
-  1. Load Q block into SRAM (stays there)
-  2. Read kv_num_blocks[q_block_idx] to know how many KV blocks to process
-  3. For each active KV block:
-     a. Read kv_indices to get which KV block column
-     b. Read block_mask_types to get mask type
-     c. If MASKED: skip
-     d. If CAUSAL: apply causal mask to qk scores
-     e. If FULL: no masking
-     f. Update online softmax statistics
-     g. Accumulate output
-  4. Write back output and LSE
-```
-
-### Memory Efficiency
-
-- **Q blocks**: Loaded once per Q block, stay in SRAM
-- **K/V blocks**: Loaded on-demand based on BlockMask
-- **S matrix**: Never materialized (computed on-the-fly with tiling)
-- **Output**: Accumulated incrementally, scaled at the end
-
-### Performance Optimizations
-
-1. **Skip masked blocks**: Don't load K/V for fully masked blocks
-2. **Separate full blocks**: Can optimize FULL blocks (no mask computation needed)
-3. **Online softmax**: Avoids storing full attention matrix
-4. **Tiling**: Reduces memory bandwidth
-
-## Usage Examples
-
-### Causal Attention
-```python
-kv_num_blocks, kv_indices, block_mask_types = create_causal_block_mask(
-    batch=1, nheads=8, seqlen_q=1024, seqlen_k=1024
-)
-output, lse = omni_attention_forward(q, k, v, kv_num_blocks, kv_indices, block_mask_types)
-```
-
-### Full Attention
-```python
-kv_num_blocks, kv_indices, block_mask_types = create_full_block_mask(
-    batch=1, nheads=8, seqlen_q=1024, seqlen_k=1024
-)
-output, lse = omni_attention_forward(q, k, v, kv_num_blocks, kv_indices, block_mask_types)
-```
-
-### Hybrid (Prefix-LM)
-```python
-# Full attention for prefix, causal for rest
-kv_num_blocks, kv_indices, block_mask_types = create_hybrid_block_mask(
-    batch=1, nheads=8, seqlen_q=1024, seqlen_k=1024, prefix_len=256
-)
-output, lse = omni_attention_forward(q, k, v, kv_num_blocks, kv_indices, block_mask_types)
-```
-
-### Custom Pattern
-```python
-def custom_pattern(q_idx, kv_idx):
-    if q_idx < 2 and kv_idx < 2:
-        return BlockMaskType.FULL  # First 2 blocks: full attention
-    elif kv_idx <= q_idx:
-        return BlockMaskType.CAUSAL  # Rest: causal
+# ============================================================================
+# Helper Function: should_mask_partial
+# ============================================================================
+# Determines if a (q_idx, kv_idx) position should be masked in a PARTIAL block
+# This handles cases where blocks cross tile boundaries
+def should_mask_partial(q_idx, kv_idx, q_block_start, q_block_end,
+                       kv_block_start, kv_block_end):
+    # Example: VLM-style interleaved pattern
+    # - Some rows in Q block attend to full KV block
+    # - Some rows in Q block attend to partial KV block (causal-like)
+    # 
+    # Implementation depends on specific partial mask pattern:
+    # - Could use additional metadata (e.g., row_mask_ranges)
+    # - Could compute based on position relative to boundaries
+    # - Could use a lookup table or bitmask
+    
+    # For now, simple heuristic: treat as causal if near boundaries
+    q_rel = q_idx - q_block_start
+    kv_rel = kv_idx - kv_block_start
+    
+    # Example: first half of Q block is causal, second half is full
+    if q_rel < (q_block_end - q_block_start) // 2:
+        return q_idx < kv_idx  # Causal
     else:
-        return BlockMaskType.MASKED
-
-kv_num_blocks, kv_indices, block_mask_types = create_omni_block_mask(
-    batch=1, nheads=8, seqlen_q=1024, seqlen_k=1024, 
-    block_mask_pattern=custom_pattern
-)
+        return False  # Full
+    
+    # Or: use row-specific mask ranges stored in additional tensor
+    # row_mask_start = row_mask_ranges[q_idx, 0]
+    # row_mask_end = row_mask_ranges[q_idx, 1]
+    # return kv_idx < row_mask_start or kv_idx >= row_mask_end
 ```
 
-## Comparison with Alternatives
-
-### vs FlashAttention-2
-- ✅ Supports block-sparse patterns (not just causal)
-- ✅ Can skip blocks entirely (better for very sparse patterns)
-- ✅ Per-block mask types (more flexible)
-- ⚠️ Slightly more complex kernel (but still efficient)
-
-### vs FlexAttention
-- ✅ Uses proven FlashAttention-2 tiling strategy
-- ✅ Simpler block mask format (just indices + types)
-- ✅ More explicit about mask types (FULL/CAUSAL/MASKED)
-- ⚠️ Less general than FlexAttention's score_mod (but more efficient)
-
-## Future Enhancements
-
-1. **Backward pass**: Implement gradient computation
-2. **Variable block sizes**: Support different BLOCK_M/BLOCK_N per region
-3. **Attention bias**: Add support for ALiBi or other biases
-4. **Multi-query attention**: Support MQA/GQA
-5. **Autotuning**: Add Triton autotune for optimal block sizes
-
+``` python
+# ============================================================================
+# Design Notes
+# ============================================================================
+# 1. Block Boundary Handling:
+#    - A KV block (BLOCK_SIZE) may span multiple tiles (Bc)
+#    - Each tile is processed independently with proper boundary checks
+#    - Mask is applied per-tile based on effective_kv_start/end
+#
+# 2. Mask Types:
+#    - MASKED: Skip entire block (no K/V load, no computation)
+#    - FULL: No masking, process all positions in block
+#    - CAUSAL: Apply causal mask (q_idx >= kv_idx) within block
+#    - PARTIAL: Custom mask pattern (requires additional logic/metadata)
+#
+# 3. Cross-Boundary Blocks:
+#    - When BLOCK_SIZE > Bc, a block spans multiple tiles
+#    - Each tile processes its portion with proper mask application
+#    - effective_kv_start/end ensure correct masking at boundaries
+#
+# 4. Memory Efficiency:
+#    - Q loaded once per Q block, stays in smem
+#    - K/V loaded per tile within active blocks
+#    - S matrix never fully materialized (computed on-the-fly)
+#    - Output accumulated incrementally with online softmax
+#
+# 5. Performance Considerations:
+#    - Stage 1 (no prefetch): Simpler, lower memory usage
+#    - Stage 2 (with prefetch): Overlap compute and memory, higher throughput
+#    - Block mask sparsity reduces unnecessary K/V loads
+#    - Mask application adds minimal overhead (element-wise operations)
+```
 
 ## Test
 
