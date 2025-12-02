@@ -30,7 +30,7 @@ First I setup the cuda kernel building environment and make sure it can be bind 
 - [x] Finish naive attention cuda kernel with randomly generated interleaved masking
 - [x] FInish applying the q-tiling strategy/copy async to the omni attention kernel
 - [x] Finish applying the MMA computation units
-- [] Working on applying the shared kv strategy to the omni attention kernel
+* [ ] Working on applying the shared kv strategy to the omni attention kernel
 
 ### Future Deliverables
 - [ ] Improve the performance by implementing double buffering to prefetch kv and overlap compute and memory
