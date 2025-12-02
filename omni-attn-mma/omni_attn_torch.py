@@ -383,17 +383,75 @@ def omni_attention_mma(
     Returns:
         output: [batch, nheads, q_len, head_dim]
     """
+    # Set up LD_LIBRARY_PATH for PyTorch libraries if needed
+    import os
     try:
-        import omni_attn_mma_cuda
-    except ImportError:
-        raise ImportError(
-            "CUDA MMA kernel not found. Please build the extension first:\n"
-            "cd omni-attn-mma && python setup.py install"
-        )
+        import torch
+        torch_lib_path = os.path.join(os.path.dirname(torch.__file__), 'lib')
+        if os.path.exists(torch_lib_path):
+            current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+            if torch_lib_path not in current_ld_path:
+                os.environ['LD_LIBRARY_PATH'] = f"{torch_lib_path}:{current_ld_path}" if current_ld_path else torch_lib_path
+    except Exception:
+        pass  # Continue even if torch import fails
+    
+    try:
+        from omni_attn import omni_attn_mma_stages_split_q_shared_kv
+    except (ImportError, OSError) as e:
+        # Try loading from current directory if not installed
+        import sys
+        import importlib.util
+        
+        # Look for .so file in current directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        so_files = [
+            os.path.join(current_dir, 'omni_attn.cpython-312-x86_64-linux-gnu.so'),
+            os.path.join(current_dir, 'omni_attn.so'),
+        ]
+        
+        module = None
+        for so_path in so_files:
+            if os.path.exists(so_path):
+                try:
+                    # Use the module name that matches setup.py
+                    spec = importlib.util.spec_from_file_location('omni_attn', so_path)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        omni_attn_mma_stages_split_q_shared_kv = getattr(module, 'omni_attn_mma_stages_split_q_shared_kv')
+                        break
+                except Exception as load_err:
+                    continue
+        
+        if module is None:
+            raise ImportError(
+                "CUDA MMA kernel not found. Please build the extension first:\n"
+                "cd omni-attn-mma && python setup.py build_ext --inplace\n"
+                f"Or ensure the .so file is in: {current_dir}\n"
+                f"Original error: {e}"
+            )
     
     B, H, Q, D = query.shape
+    _, _, KV, _ = key.shape
     
-    # Ensure contiguous and correct dtype
+    # Validate shapes
+    assert key.shape == (B, H, KV, D), f"Key shape mismatch: {key.shape} vs expected {(B, H, KV, D)}"
+    assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
+    assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
+    assert Q == block_mask.q_len, f"Query length mismatch: Q={Q}, block_mask.q_len={block_mask.q_len}"
+    assert KV == block_mask.kv_len, f"KV length mismatch: KV={KV}, block_mask.kv_len={block_mask.kv_len}"
+    
+    # Validate block mask shapes
+    num_q_blocks = (Q + block_mask.BLOCK_SIZE - 1) // block_mask.BLOCK_SIZE
+    assert block_mask.kv_num_blocks.shape == (B, H, num_q_blocks), \
+        f"kv_num_blocks shape mismatch: {block_mask.kv_num_blocks.shape} vs expected {(B, H, num_q_blocks)}"
+    max_blocks = block_mask.kv_indices.shape[3]
+    assert block_mask.kv_indices.shape == (B, H, num_q_blocks, max_blocks), \
+        f"kv_indices shape mismatch: {block_mask.kv_indices.shape} vs expected {(B, H, num_q_blocks, max_blocks)}"
+    assert block_mask.block_mask_types.shape == (B, H, num_q_blocks, max_blocks), \
+        f"block_mask_types shape mismatch: {block_mask.block_mask_types.shape} vs expected {(B, H, num_q_blocks, max_blocks)}"
+    
+    # Ensure contiguous and correct dtype for Q, K, V
     query = query.contiguous().half()
     key = key.contiguous().half()
     value = value.contiguous().half()
@@ -401,12 +459,31 @@ def omni_attention_mma(
     # Create output tensor
     output = torch.empty_like(query)
     
+    # Ensure block mask tensors are int32 and contiguous
+    kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
+    kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
+    block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
+    
+    # Validate head_dim is supported (32, 64, 128)
+    if D not in [32, 64, 128]:
+        raise ValueError(
+            f"Unsupported head_dim={D}. Supported values: 32, 64, 128. "
+            f"Please use D that results in head_dim in [32, 64, 128] (e.g., D=256 with H=8 gives head_dim=32)."
+        )
+    
+    # Validate BLOCK_SIZE is supported (64 or 128)
+    if block_mask.BLOCK_SIZE not in [64, 128]:
+        raise ValueError(
+            f"Unsupported BLOCK_SIZE={block_mask.BLOCK_SIZE}. Supported values: 64, 128. "
+            f"Please use --block_size 64 or --block_size 128."
+        )
+    
     # Call CUDA kernel
-    omni_attn_mma_cuda.omni_attn_mma_stages_split_q_shared_kv(
+    omni_attn_mma_stages_split_q_shared_kv(
         query, key, value, output,
-        block_mask.kv_num_blocks,
-        block_mask.kv_indices,
-        block_mask.block_mask_types,
+        kv_num_blocks,
+        kv_indices,
+        block_mask_types,
         stages,
     )
     
@@ -806,6 +883,8 @@ def generate_random_input_with_modalities(
         batch_modality_positions = []
         offset = 0
         current_length = 0
+        text_in_row = 0
+        image_in_row = 0
 
         is_last_segment = False
 
@@ -816,9 +895,16 @@ def generate_random_input_with_modalities(
             
             # Alternate between text and image, either 0 or 1
             text_or_image = torch.randint(0, 2, ()).item()
-            
+
+            if text_in_row > 1:
+                text_or_image = 1
+            if image_in_row > 1:
+                text_or_image = 0
+
             if text_or_image == 0:
                 # Generate text segment
+                text_in_row += 1
+                image_in_row = 0
                 if remaining > max_text_len:
                     text_len = torch.randint(min_text_len, max_text_len + 1, (1,)).item()
                 elif remaining > min_text_len:
@@ -834,6 +920,8 @@ def generate_random_input_with_modalities(
                 print(f"text_len: {text_len}")
             else:
                 # Generate image segment
+                image_in_row += 1
+                text_in_row = 0
                 max_image_len = max_image_size * max_image_size
                 min_image_len = min_image_size * min_image_size
                 

@@ -181,15 +181,15 @@ def get_build_cuda_cflags(build_pkg: bool = False):
     extra_cuda_cflags.append(
         "-Xptxas -v" if not build_pkg else "--ptxas-options=-O3"
     )
-    # Point include paths to the actual omni-attn source tree
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/utils")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma/basic")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma/swizzle")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/mma/others")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/cutlass")
-    extra_cuda_cflags.append(f"-I {project_dir}/attention/omni-attn/pybind")
+    # Point include paths to the actual flash-attn-mma source tree
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/utils")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/mma")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/mma/basic")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/mma/swizzle")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/mma/others")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/cutlass")
+    extra_cuda_cflags.append(f"-I {project_dir}/attention/flash-attn-mma/pybind")
     # If CUTLASS is installed separately, uncomment and set the proper include paths below:
     # extra_cuda_cflags.append(f"-I {project_dir}/third-party/cutlass/include")
     # extra_cuda_cflags.append(f"-I {project_dir}/third-party/cutlass/tools/util/include")
@@ -695,31 +695,6 @@ for B, H, N, D in BHNDs:
                     kv_indices[b, h, q_idx, kv_idx] = kv_idx
                     block_mask_types[b, h, q_idx, kv_idx] = 2  # FULL
     
-    # Benchmark omni-attn-mma kernel
-    def omni_attn_benchmark_func(q, k, v, o, stages):
-        lib.omni_attn_mma_stages_split_q_shared_kv(
-            q, k, v, o, kv_num_blocks, kv_indices, block_mask_types, stages
-        )
-        return o
-    
-    out_omni_mma_share_kv1, _ = run_benchmark(
-        lambda q, k, v, o, s: omni_attn_benchmark_func(q, k, v, o, 1),
-        q,
-        k,
-        v,
-        "omni-mma(split-q+share-kv+stage1)",
-        o,
-        stages=1,
-    )
-    out_omni_mma_share_kv2, _ = run_benchmark(
-        lambda q, k, v, o, s: omni_attn_benchmark_func(q, k, v, o, 2),
-        q,
-        k,
-        v,
-        "omni-mma(split-q+share-kv+stage2)",
-        o,
-        stages=2,
-    )
     out_mma_share_kv_f321, _ = run_benchmark(
         lib.flash_attn_mma_stages_split_q_shared_kv_acc_f32,
         q,

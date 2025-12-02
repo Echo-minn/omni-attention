@@ -239,6 +239,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     }
     CP_ASYNC_COMMIT_GROUP();
   }
+  
 
 // <loop over K seqlen>: for K^T[d,seqlen] with K^T_tile[d,Bc]
 // tile_K_seqlen: compute S_tile[Br,Bc] = Q@K^T = Q_tile[Br,d] * K^T[d,Bc]

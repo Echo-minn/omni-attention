@@ -39,7 +39,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 # Source files
 sources = [
     os.path.join(this_dir, "pybind", "omni_attn.cc"),
-    os.path.join(this_dir, "mma", "omni_attn_mma_share_kv.cu"),
+    os.path.join(this_dir, "mma", "omni_attn.cu"),
 ]
 
 # Include directories
@@ -71,13 +71,13 @@ extra_compile_args = {
 }
 
 setup(
-    name="omni_attn_mma_cuda",
+    name="omni_attn",
     version="0.1.0",
     description="Omni-Attention with CUDA MMA kernels",
     author="Omni-Attention Team",
     ext_modules=[
         CUDAExtension(
-            name="omni_attn_mma_cuda",
+            name="omni_attn",
             sources=sources,
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,

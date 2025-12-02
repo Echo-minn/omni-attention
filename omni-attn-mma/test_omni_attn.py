@@ -21,6 +21,7 @@ from omni_attn_torch import (
     pad_modalities_to_block_size,
     print_block_structure,
     check_correctness,
+    omni_attention_mma,
 )
 
 # Import from transfusion for flex_attention
@@ -116,19 +117,19 @@ def main():
     
     # Get embeddings
     x = get_embeddings_from_text_and_images(text_and_images, D=D, device=device)
-    original_seq_len = x.shape[1]
+    seq_len = x.shape[1]
     
     # Print block structure BEFORE padding
-    print("\nBEFORE padding (seq_len={}):".format(original_seq_len))
-    print_block_structure(modality_positions, q_len=original_seq_len, BLOCK_SIZE=BLOCK_SIZE, batch_idx=0)
+    print("\nBEFORE padding (seq_len={}):".format(seq_len))
+    print_block_structure(modality_positions, q_len=seq_len, BLOCK_SIZE=BLOCK_SIZE, batch_idx=0)
     
     # Pad each modality separately
-    x_padded, modality_positions_padded = pad_modalities_to_block_size(x, modality_positions, BLOCK_SIZE=BLOCK_SIZE)
-    padded_seq_len = x_padded.shape[1]
+    # x_padded, modality_positions_padded = pad_modalities_to_block_size(x, modality_positions, BLOCK_SIZE=BLOCK_SIZE)
+    # padded_seq_len = x_padded.shape[1]
     
     # Print block structure AFTER padding
-    print("\nAFTER padding (seq_len={}, added={}):".format(padded_seq_len, padded_seq_len - original_seq_len))
-    print_block_structure(modality_positions_padded, q_len=padded_seq_len, BLOCK_SIZE=BLOCK_SIZE, batch_idx=0)
+    # print("\nAFTER padding (seq_len={}, added={}):".format(padded_seq_len, padded_seq_len - seq_len))
+    # print_block_structure(modality_positions_padded, q_len=padded_seq_len, BLOCK_SIZE=BLOCK_SIZE, batch_idx=0)
     
     # Create Q, K, V
     head_dim = D // H
@@ -139,25 +140,25 @@ def main():
     W_V = randn(D, D, device=device)
     
     # Project and reshape to [B, H, N, head_dim]
-    x_proj_q = torch.matmul(x_padded, W_Q)  # [B, N, D]
-    x_proj_k = torch.matmul(x_padded, W_K)
-    x_proj_v = torch.matmul(x_padded, W_V)
+    x_proj_q = torch.matmul(x, W_Q)  # [B, N, D]
+    x_proj_k = torch.matmul(x, W_K)
+    x_proj_v = torch.matmul(x, W_V)
     
-    Q = x_proj_q.view(B, padded_seq_len, H, head_dim).transpose(1, 2)  # [B, H, N, head_dim]
-    K = x_proj_k.view(B, padded_seq_len, H, head_dim).transpose(1, 2)
-    V = x_proj_v.view(B, padded_seq_len, H, head_dim).transpose(1, 2)
+    Q = x_proj_q.view(B, seq_len, H, head_dim).transpose(1, 2)  # [B, H, N, head_dim]
+    K = x_proj_k.view(B, seq_len, H, head_dim).transpose(1, 2)
+    V = x_proj_v.view(B, seq_len, H, head_dim).transpose(1, 2)
     
     # Create masks - use SAME mask logic for both naive and flex_attention
     if HAS_FLEX_ATTN:
-        dense_mask = naive_attn_mask(padded_seq_len, modality_positions_padded, device=device)  # [B, N, N]
-        dense_mask = dense_mask.unsqueeze(1).expand(B, H, padded_seq_len, padded_seq_len)  # [B, H, N, N]
+        dense_mask = naive_attn_mask(seq_len, modality_positions, device=device)  # [B, N, N]
+        dense_mask = dense_mask.unsqueeze(1).expand(B, H, seq_len, seq_len)  # [B, H, N, N]
         flex_block_mask = create_flex_block_mask(
-            modality_positions_padded, B=B, H=H, Q_LEN=padded_seq_len, KV_LEN=padded_seq_len,
+            modality_positions, B=B, H=H, Q_LEN=seq_len, KV_LEN=seq_len,
             device=device, compile_mask=False,
         )
     else:
-        dense_mask = naive_attn_mask(padded_seq_len, modality_positions_padded, device=device)  # [B, N, N]
-        dense_mask = dense_mask.unsqueeze(1).expand(B, H, padded_seq_len, padded_seq_len)  # [B, H, N, N]
+        dense_mask = naive_attn_mask(seq_len, modality_positions, device=device)  # [B, N, N]
+        dense_mask = dense_mask.unsqueeze(1).expand(B, H, seq_len, seq_len)  # [B, H, N, N]
         flex_block_mask = None
     
     # Run correctness tests
@@ -167,11 +168,59 @@ def main():
     naive_output = naive_attention_with_dense_mask(Q, K, V, mask=score_mask)
     
     if HAS_FLEX_ATTN and flex_block_mask is not None:
+        print(f"flex_block_mask: {flex_block_mask.shape}")
         _ = flex_attention(Q, K, V, block_mask=flex_block_mask)  # Warmup
         flex_output = flex_attention(Q, K, V, block_mask=flex_block_mask)
         check_correctness(naive_output, flex_output, rtol=1e-2, atol=1e-3, name="flex_attention")
     else:
         print("Skipping flex_attention (not available)")
+    
+    # Test CUDA MMA kernel
+    print("\nTesting CUDA MMA kernel...")
+    try:
+        # Create OmniBlockMask from modality_positions
+        # This follows the same logic as transfusion's create_block_mask
+        omni_block_mask = create_omni_block_mask_from_modality_positions(
+            modality_positions=modality_positions,
+            batch=B,
+            nheads=H,
+            q_len=seq_len,
+            kv_len=seq_len,
+            BLOCK_SIZE=BLOCK_SIZE,
+            device=device,
+        )
+        
+        print(f"  Created OmniBlockMask: {omni_block_mask.shape}, sparsity={omni_block_mask.sparsity():.2f}%")
+        
+        # Ensure Q, K, V are contiguous (the wrapper handles dtype conversion to half)
+        Q_cuda = Q.contiguous()
+        K_cuda = K.contiguous()
+        V_cuda = V.contiguous()
+        
+        # Warmup
+        _ = omni_attention_mma(Q_cuda, K_cuda, V_cuda, omni_block_mask, stages=2)
+        
+        # Run kernel
+        mma_output = omni_attention_mma(Q_cuda, K_cuda, V_cuda, omni_block_mask, stages=2)
+        
+        # Compare with naive output
+        # Note: The kernel uses half precision, so we need to account for that
+        naive_output_fp16 = naive_output.half()
+        check_correctness(
+            naive_output_fp16, 
+            mma_output, 
+            rtol=1e-1,  # More relaxed tolerance for half precision
+            atol=1e-2, 
+            name="omni_attention_mma"
+        )
+        
+    except ImportError as e:
+        print(f"  ✗ CUDA MMA kernel not available: {e}")
+        print("  To build the kernel, run: cd omni-attn-mma && python setup.py install")
+    except Exception as e:
+        print(f"  ✗ Error running CUDA MMA kernel: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
