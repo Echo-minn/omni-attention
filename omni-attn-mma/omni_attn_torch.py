@@ -33,10 +33,12 @@ class BlockMaskType(IntEnum):
     MASKED (0): Block is fully masked out - skip computation entirely
     CAUSAL (1): Block uses causal masking (q_idx >= kv_idx)
     FULL (2): Block has no masking - full attention
+    PARTIAL (3): Block is partially masked (cross-modality or mixed content)
     """
     MASKED = 0  # Skip block entirely (don't load K/V)
     CAUSAL = 1  # Apply causal masking within block
     FULL = 2    # No masking (dense attention)
+    PARTIAL = 3  # Partially masked (requires per-token mask check)
 
 
 # ============================================================================
@@ -118,6 +120,13 @@ class OmniBlockMask:
                             for qi in range(q_start, q_end):
                                 for ki in range(kv_start, min(qi + 1, kv_end)):
                                     dense_mask[b, h, qi, ki] = True
+                        elif mask_type == BlockMaskType.PARTIAL:
+                            # PARTIAL: Block contains mixed content or crosses boundaries
+                            # Use CAUSAL as conservative fallback (requires per-token check in actual kernel)
+                            # In practice, PARTIAL blocks need the original modality info for accurate masking
+                            for qi in range(q_start, q_end):
+                                for ki in range(kv_start, min(qi + 1, kv_end)):
+                                    dense_mask[b, h, qi, ki] = True
         
         return dense_mask
     
@@ -138,6 +147,75 @@ class OmniBlockMask:
         B, H = self.kv_num_blocks.shape[:2]
         avg_active = active_blocks / (B * H)
         return 100.0 * (1.0 - avg_active / total_blocks)
+
+
+def omni_block_mask_from_flex_block_mask(flex_block_mask) -> OmniBlockMask:
+    """Convert flex_attention's BlockMask to OmniBlockMask.
+    
+    This is useful for debugging - allows using flex_attention's block_mask
+    (which passes correctness) with CUDA kernels to isolate bugs.
+    
+    Args:
+        flex_block_mask: flex_attention BlockMask object
+        
+    Returns:
+        OmniBlockMask with same kv_num_blocks and kv_indices as flex_block_mask
+    """
+    # Get dimensions
+    q_len, kv_len = flex_block_mask.seq_lengths
+    if isinstance(flex_block_mask.BLOCK_SIZE, tuple):
+        q_block_size, kv_block_size = flex_block_mask.BLOCK_SIZE
+        assert q_block_size == kv_block_size, "Different Q/KV block sizes not supported"
+        block_size = q_block_size
+    else:
+        block_size = flex_block_mask.BLOCK_SIZE
+    
+    # Get kv_num_blocks and kv_indices
+    kv_num_blocks = flex_block_mask.kv_num_blocks.clone()
+    kv_indices = flex_block_mask.kv_indices.clone()
+    
+    # Ensure correct shape [B, H, num_q_blocks] for kv_num_blocks
+    # and [B, H, num_q_blocks, max_blocks] for kv_indices
+    if kv_num_blocks.dim() == 1:
+        # Shape is [num_q_blocks], need to add B and H dimensions
+        # Assume B=1, H=1 (will need to expand later)
+        kv_num_blocks = kv_num_blocks.unsqueeze(0).unsqueeze(0)  # [1, 1, num_q_blocks]
+        kv_indices = kv_indices.unsqueeze(0).unsqueeze(0)  # [1, 1, num_q_blocks, max_blocks]
+    elif kv_num_blocks.dim() == 2:
+        # Shape is [H, num_q_blocks], add B dimension
+        kv_num_blocks = kv_num_blocks.unsqueeze(0)  # [1, H, num_q_blocks]
+        kv_indices = kv_indices.unsqueeze(0)  # [1, H, num_q_blocks, max_blocks]
+    # else: already [B, H, num_q_blocks] or [B, H, num_q_blocks, max_blocks]
+    
+    B, H, num_q_blocks = kv_num_blocks.shape
+    _, _, _, max_blocks = kv_indices.shape
+    
+    # Create block_mask_types - set all to PARTIAL since flex_attention uses mask_mod
+    # for per-token masking (we don't know the exact mask type per block)
+    block_mask_types = torch.full(
+        (B, H, num_q_blocks, max_blocks),
+        BlockMaskType.PARTIAL,
+        dtype=torch.int32,
+        device=kv_num_blocks.device
+    )
+    
+    # Set mask types to MASKED for positions beyond kv_num_blocks
+    for b in range(B):
+        for h in range(H):
+            for q_block in range(num_q_blocks):
+                num_active = kv_num_blocks[b, h, q_block].item()
+                # Positions beyond num_active are already invalid (won't be accessed)
+                # but we can mark them as MASKED for clarity
+                block_mask_types[b, h, q_block, num_active:] = BlockMaskType.MASKED
+    
+    return OmniBlockMask(
+        kv_num_blocks=kv_num_blocks.to(torch.int32),
+        kv_indices=kv_indices.to(torch.int32),
+        block_mask_types=block_mask_types,
+        q_len=q_len,
+        kv_len=kv_len,
+        BLOCK_SIZE=block_size,
+    )
 
 
 # ============================================================================
@@ -383,23 +461,12 @@ def omni_attention_mma(
     Returns:
         output: [batch, nheads, q_len, head_dim]
     """
-    # Set up LD_LIBRARY_PATH for PyTorch libraries if needed
-    import os
-    try:
-        import torch
-        torch_lib_path = os.path.join(os.path.dirname(torch.__file__), 'lib')
-        if os.path.exists(torch_lib_path):
-            current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
-            if torch_lib_path not in current_ld_path:
-                os.environ['LD_LIBRARY_PATH'] = f"{torch_lib_path}:{current_ld_path}" if current_ld_path else torch_lib_path
-    except Exception:
-        pass  # Continue even if torch import fails
-    
     try:
         from omni_attn import omni_attn_mma_stages_split_q_shared_kv
-    except (ImportError, OSError) as e:
+    except ImportError:
         # Try loading from current directory if not installed
         import sys
+        import os
         import importlib.util
         
         # Look for .so file in current directory
@@ -420,15 +487,14 @@ def omni_attention_mma(
                         spec.loader.exec_module(module)
                         omni_attn_mma_stages_split_q_shared_kv = getattr(module, 'omni_attn_mma_stages_split_q_shared_kv')
                         break
-                except Exception as load_err:
+                except Exception as e:
                     continue
         
         if module is None:
             raise ImportError(
                 "CUDA MMA kernel not found. Please build the extension first:\n"
                 "cd omni-attn-mma && python setup.py build_ext --inplace\n"
-                f"Or ensure the .so file is in: {current_dir}\n"
-                f"Original error: {e}"
+                f"Or ensure the .so file is in: {current_dir}"
             )
     
     B, H, Q, D = query.shape
@@ -438,11 +504,24 @@ def omni_attention_mma(
     assert key.shape == (B, H, KV, D), f"Key shape mismatch: {key.shape} vs expected {(B, H, KV, D)}"
     assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
     assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
-    assert Q == block_mask.q_len, f"Query length mismatch: Q={Q}, block_mask.q_len={block_mask.q_len}"
-    assert KV == block_mask.kv_len, f"KV length mismatch: KV={KV}, block_mask.kv_len={block_mask.kv_len}"
+    
+    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # The mask is already created with padded length, so we just need to pad Q, K, V
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    
+    Q_padded = query_padded.shape[2]
+    KV_padded = key_padded.shape[2]
+    
+    # Validate that padded lengths match mask (mask should already be padded)
+    assert Q_padded == block_mask.q_len, \
+        f"Padded Q length ({Q_padded}) doesn't match mask q_len ({block_mask.q_len})"
+    assert KV_padded == block_mask.kv_len, \
+        f"Padded KV length ({KV_padded}) doesn't match mask kv_len ({block_mask.kv_len})"
     
     # Validate block mask shapes
-    num_q_blocks = (Q + block_mask.BLOCK_SIZE - 1) // block_mask.BLOCK_SIZE
+    num_q_blocks = Q_padded // block_mask.BLOCK_SIZE
     assert block_mask.kv_num_blocks.shape == (B, H, num_q_blocks), \
         f"kv_num_blocks shape mismatch: {block_mask.kv_num_blocks.shape} vs expected {(B, H, num_q_blocks)}"
     max_blocks = block_mask.kv_indices.shape[3]
@@ -452,12 +531,12 @@ def omni_attention_mma(
         f"block_mask_types shape mismatch: {block_mask.block_mask_types.shape} vs expected {(B, H, num_q_blocks, max_blocks)}"
     
     # Ensure contiguous and correct dtype for Q, K, V
-    query = query.contiguous().half()
-    key = key.contiguous().half()
-    value = value.contiguous().half()
+    query_padded = query_padded.contiguous().half()
+    key_padded = key_padded.contiguous().half()
+    value_padded = value_padded.contiguous().half()
     
-    # Create output tensor
-    output = torch.empty_like(query)
+    # Create output tensor (padded size)
+    output_padded = torch.empty_like(query_padded)
     
     # Ensure block mask tensors are int32 and contiguous
     kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
@@ -480,12 +559,299 @@ def omni_attention_mma(
     
     # Call CUDA kernel
     omni_attn_mma_stages_split_q_shared_kv(
-        query, key, value, output,
+        query_padded, key_padded, value_padded, output_padded,
         kv_num_blocks,
         kv_indices,
         block_mask_types,
         stages,
+        block_mask.BLOCK_SIZE,
     )
+    
+    # Synchronize to catch any CUDA errors immediately
+    torch.cuda.synchronize()
+    
+    # Slice back to original length
+    output = output_padded[:, :, :q_orig_len, :]
+    
+    return output
+
+
+def _pad_to_block_size(x: Tensor, BLOCK_SIZE: int) -> Tuple[Tensor, int]:
+    """Pad tensor's sequence dimension to multiple of BLOCK_SIZE.
+    
+    Args:
+        x: [..., seq_len, ...] tensor
+        BLOCK_SIZE: Block size to pad to
+        
+    Returns:
+        padded_x: Padded tensor
+        original_len: Original sequence length
+    """
+    *leading_dims, seq_len = x.shape[:-1]
+    head_dim = x.shape[-1]
+    
+    padded_len = ((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    if padded_len == seq_len:
+        return x, seq_len
+    
+    padding_size = padded_len - seq_len
+    # Pad with zeros on the sequence dimension
+    padding = torch.zeros(*leading_dims, padding_size, head_dim, 
+                         device=x.device, dtype=x.dtype)
+    padded_x = torch.cat([x, padding], dim=-2)
+    return padded_x, seq_len
+
+
+def omni_attention_simple(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    block_mask: OmniBlockMask,
+    scale: Optional[float] = None,
+    dense_mask: Optional[Tensor] = None,  # Optional: pre-computed dense mask for PARTIAL blocks
+) -> Tensor:
+    """Omni-Attention with simple CUDA kernel (correctness baseline).
+    
+    This is a wrapper for the simple CUDA kernel that serves as a correctness
+    baseline. It's not performance-optimized but is easier to reason about.
+    
+    Args:
+        query: [batch, nheads, q_len, head_dim]
+        key: [batch, nheads, kv_len, head_dim]
+        value: [batch, nheads, kv_len, head_dim]
+        block_mask: OmniBlockMask for sparse attention
+        scale: Attention scale (default: 1/sqrt(head_dim))
+        
+    Returns:
+        output: [batch, nheads, q_len, head_dim]
+    """
+    try:
+        from omni_attn import omni_attn_simple_kernel
+    except ImportError:
+        # Try loading from current directory if not installed
+        import sys
+        import os
+        import importlib.util
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        so_files = [
+            os.path.join(current_dir, 'omni_attn.cpython-312-x86_64-linux-gnu.so'),
+            os.path.join(current_dir, 'omni_attn.so'),
+        ]
+        
+        module = None
+        for so_path in so_files:
+            if os.path.exists(so_path):
+                try:
+                    spec = importlib.util.spec_from_file_location('omni_attn', so_path)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        omni_attn_simple_kernel = getattr(module, 'omni_attn_simple_kernel')
+                        break
+                except Exception as e:
+                    continue
+        
+        if module is None:
+            raise ImportError(
+                "CUDA simple kernel not found. Please build the extension first:\n"
+                "cd omni-attn-mma && python setup.py build_ext --inplace\n"
+                f"Or ensure the .so file is in: {current_dir}"
+            )
+    
+    B, H, Q, D = query.shape
+    _, _, KV, _ = key.shape
+    
+    # Validate shapes
+    assert key.shape == (B, H, KV, D), f"Key shape mismatch: {key.shape} vs expected {(B, H, KV, D)}"
+    assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
+    assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
+    
+    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # The mask is already created with padded length, so we just need to pad Q, K, V
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    
+    Q_padded = query_padded.shape[2]
+    KV_padded = key_padded.shape[2]
+    
+    # Validate that padded lengths match mask (mask should already be padded)
+    assert Q_padded == block_mask.q_len, \
+        f"Padded Q length ({Q_padded}) doesn't match mask q_len ({block_mask.q_len})"
+    assert KV_padded == block_mask.kv_len, \
+        f"Padded KV length ({KV_padded}) doesn't match mask kv_len ({block_mask.kv_len})"
+    
+    # Ensure contiguous and correct dtype for Q, K, V
+    query_padded = query_padded.contiguous().half()
+    key_padded = key_padded.contiguous().half()
+    value_padded = value_padded.contiguous().half()
+    
+    # Create output tensor (padded size)
+    output_padded = torch.empty_like(query_padded)
+    
+    # Ensure block mask tensors are int32 and contiguous
+    kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
+    kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
+    block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
+    
+    # Check if we have PARTIAL blocks - if so, we need dense_mask
+    has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
+    if has_partial:
+        if dense_mask is None:
+            # Fallback: use to_dense_mask() (treats PARTIAL as CAUSAL - not ideal)
+            # Ideally, caller should provide the correct dense_mask
+            dense_mask = block_mask.to_dense_mask().contiguous()
+        else:
+            # Validate provided dense_mask
+            B, H, Q, D = query_padded.shape
+            if dense_mask.shape != (B, H, Q_padded, KV_padded):
+                raise ValueError(
+                    f"dense_mask shape {dense_mask.shape} doesn't match "
+                    f"expected {(B, H, Q_padded, KV_padded)}"
+                )
+            dense_mask = dense_mask.contiguous()
+    
+    # Call CUDA kernel (pass original length to bound KV access)
+    omni_attn_simple_kernel(
+        query_padded, key_padded, value_padded, output_padded,
+        kv_num_blocks,
+        kv_indices,
+        block_mask_types,
+        block_mask.BLOCK_SIZE,
+        q_orig_len,  # Original sequence length (before padding)
+        dense_mask if dense_mask is not None else torch.empty(0, dtype=torch.bool, device=query_padded.device),
+    )
+    
+    # Synchronize to catch any CUDA errors immediately
+    torch.cuda.synchronize()
+    
+    # Slice back to original length
+    output = output_padded[:, :, :q_orig_len, :]
+    
+    return output
+
+
+def omni_attention_cp_async(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    block_mask: OmniBlockMask,
+    scale: Optional[float] = None,
+) -> Tensor:
+    """Omni-Attention with cp.async CUDA kernel.
+    
+    This is a wrapper for the cp.async optimized CUDA kernel that uses
+    copy-prefetch async and Q tiling strategy.
+    
+    Args:
+        query: [batch, nheads, q_len, head_dim]
+        key: [batch, nheads, kv_len, head_dim]
+        value: [batch, nheads, kv_len, head_dim]
+        block_mask: OmniBlockMask for sparse attention
+        scale: Attention scale (default: 1/sqrt(head_dim))
+        
+    Returns:
+        output: [batch, nheads, q_len, head_dim]
+    """
+    try:
+        from omni_attn import omni_attn_cp_async
+    except ImportError:
+        # Try loading from current directory if not installed
+        import sys
+        import os
+        import importlib.util
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        so_files = [
+            os.path.join(current_dir, 'omni_attn.cpython-312-x86_64-linux-gnu.so'),
+            os.path.join(current_dir, 'omni_attn.so'),
+        ]
+        
+        module = None
+        for so_path in so_files:
+            if os.path.exists(so_path):
+                try:
+                    spec = importlib.util.spec_from_file_location('omni_attn', so_path)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        omni_attn_cp_async = getattr(module, 'omni_attn_cp_async')
+                        break
+                except Exception as e:
+                    continue
+        
+        if module is None:
+            raise ImportError(
+                "CUDA cp.async kernel not found. Please build the extension first:\n"
+                "cd omni-attn-mma && python setup.py build_ext --inplace\n"
+                f"Or ensure the .so file is in: {current_dir}"
+            )
+    
+    B, H, Q, D = query.shape
+    _, _, KV, _ = key.shape
+    
+    # Validate shapes
+    assert key.shape == (B, H, KV, D), f"Key shape mismatch: {key.shape} vs expected {(B, H, KV, D)}"
+    assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
+    assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
+    
+    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # The mask is already created with padded length, so we just need to pad Q, K, V
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    
+    Q_padded = query_padded.shape[2]
+    KV_padded = key_padded.shape[2]
+    
+    # Validate that padded lengths match mask (mask should already be padded)
+    assert Q_padded == block_mask.q_len, \
+        f"Padded Q length ({Q_padded}) doesn't match mask q_len ({block_mask.q_len})"
+    assert KV_padded == block_mask.kv_len, \
+        f"Padded KV length ({KV_padded}) doesn't match mask kv_len ({block_mask.kv_len})"
+    
+    # Validate head_dim is supported (32, 64, 128)
+    if D not in [32, 64, 128]:
+        raise ValueError(
+            f"Unsupported head_dim={D}. Supported values: 32, 64, 128. "
+            f"Please use D that results in head_dim in [32, 64, 128] (e.g., D=256 with H=8 gives head_dim=32)."
+        )
+    
+    # Validate BLOCK_SIZE is supported (64 or 128)
+    if block_mask.BLOCK_SIZE not in [64, 128]:
+        raise ValueError(
+            f"Unsupported BLOCK_SIZE={block_mask.BLOCK_SIZE}. Supported values: 64, 128."
+        )
+    
+    # Ensure contiguous and correct dtype for Q, K, V
+    query_padded = query_padded.contiguous().half()
+    key_padded = key_padded.contiguous().half()
+    value_padded = value_padded.contiguous().half()
+    
+    # Create output tensor (padded size)
+    output_padded = torch.empty_like(query_padded)
+    
+    # Ensure block mask tensors are int32 and contiguous
+    kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
+    kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
+    block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
+    
+    # Call CUDA kernel (pass original length to bound KV access)
+    omni_attn_cp_async(
+        query_padded, key_padded, value_padded, output_padded,
+        kv_num_blocks,
+        kv_indices,
+        block_mask_types,
+        block_mask.BLOCK_SIZE,
+        q_orig_len,  # Original sequence length (before padding)
+    )
+    
+    # Synchronize to catch any CUDA errors immediately
+    torch.cuda.synchronize()
+    
+    # Slice back to original length
+    output = output_padded[:, :, :q_orig_len, :]
     
     return output
 
@@ -700,24 +1066,32 @@ def create_omni_block_mask_from_modality_positions(
     - Image modalities: FULL attention within same modality, FULL to all previous tokens
     - Different image modalities: MASKED (no attention between different images)
     
+    Like flex_attention, this function pads the sequence length to BLOCK_SIZE multiples
+    internally. The mask treats padding positions as masked (no attention).
+    
     Args:
         modality_positions: [B, M, 3] tensor of (modality_type, offset, length)
         batch: Batch size
         nheads: Number of attention heads
-        q_len: Query sequence length
-        kv_len: Key/value sequence length
+        q_len: Query sequence length (will be padded to BLOCK_SIZE multiple)
+        kv_len: Key/value sequence length (will be padded to BLOCK_SIZE multiple)
         BLOCK_SIZE: Block size
         device: Device
         
     Returns:
-        OmniBlockMask
+        OmniBlockMask with padded lengths
     """
-    num_q_blocks = (q_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-    num_kv_blocks = (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    q_len_padded = ((q_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    kv_len_padded = ((kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    
+    num_q_blocks = q_len_padded // BLOCK_SIZE
+    num_kv_blocks = kv_len_padded // BLOCK_SIZE
     max_blocks = num_kv_blocks
     
     # Create token type array: 0 = text, 1+ = modality id
-    token_types = torch.zeros(batch, q_len, dtype=torch.int32, device=device)
+    # Use padded length - padding positions will remain 0 (text/masked)
+    token_types = torch.zeros(batch, q_len_padded, dtype=torch.int32, device=device)
     modality_ids = {}  # Track which modality id each (b, mod_idx) maps to
     
     for b in range(batch):
@@ -748,81 +1122,117 @@ def create_omni_block_mask_from_modality_positions(
     
     for q_block in range(num_q_blocks):
         q_start = q_block * BLOCK_SIZE
-        q_end = min(q_start + BLOCK_SIZE, q_len)
-        
-        # Get dominant token type in this Q block
-        q_types = token_types[:, q_start:q_end]  # [B, block_size]
-        # For each batch, get mode
-        q_type_per_batch = []
-        for b in range(batch):
-            q_vals = q_types[b]
-            # Get most common non-zero value, or 0 if all zeros
-            unique_vals, counts = torch.unique(q_vals, return_counts=True)
-            if len(unique_vals) > 0:
-                mode_idx = counts.argmax()
-                q_type_per_batch.append(unique_vals[mode_idx].item())
-            else:
-                q_type_per_batch.append(0)
+        q_end = min(q_start + BLOCK_SIZE, q_len_padded)
+        q_effective_end = min(q_end, q_len)  # Effective end (excluding padding)
         
         for b in range(batch):
-            q_type = q_type_per_batch[b]
+            # Get Q block token types and check if it's "pure" (single type) or "mixed"
+            q_vals = token_types[b, q_start:q_end]  # [block_size]
+            q_unique = torch.unique(q_vals)
+            q_is_pure = len(q_unique) == 1 or (len(q_unique) == 2 and 0 in q_unique and (q_vals != 0).sum() == 0)
+            q_dominant_type = q_unique[0].item() if len(q_unique) > 0 else 0
+            if not q_is_pure and len(q_unique) > 0:
+                # Get dominant non-zero type
+                non_zero = q_vals[q_vals != 0]
+                if len(non_zero) > 0:
+                    q_unique_nonzero, q_counts = torch.unique(non_zero, return_counts=True)
+                    q_dominant_type = q_unique_nonzero[q_counts.argmax()].item()
             
             num_active = 0
             for kv_block in range(num_kv_blocks):
                 kv_start = kv_block * BLOCK_SIZE
-                kv_end = min(kv_start + BLOCK_SIZE, kv_len)
+                kv_end = min(kv_start + BLOCK_SIZE, kv_len_padded)
+                kv_effective_end = min(kv_end, kv_len)  # Effective end (excluding padding)
                 
-                # Get dominant token type in this KV block
-                kv_vals = token_types[b, kv_start:kv_end]
-                unique_vals, counts = torch.unique(kv_vals, return_counts=True)
-                if len(unique_vals) > 0:
-                    mode_idx = counts.argmax()
-                    kv_type = unique_vals[mode_idx].item()
-                else:
-                    kv_type = 0
+                # Mask padding blocks (beyond original sequence length)
+                if kv_start >= kv_len or q_start >= q_len:
+                    continue  # Skip this KV block
                 
-                # Determine mask type
-                # Rules:
-                # - Text: CAUSAL only (Q >= KV)
-                # - Image: FULL within same modality OR FULL for all previous blocks
-                if q_type > 0 and kv_type > 0:
-                    # Both are modalities
-                    if q_type == kv_type:
+                # Get KV block token types and check if it's "pure" or "mixed"
+                kv_vals = token_types[b, kv_start:kv_end]  # [block_size]
+                kv_unique = torch.unique(kv_vals)
+                kv_is_pure = len(kv_unique) == 1 or (len(kv_unique) == 2 and 0 in kv_unique and (kv_vals != 0).sum() == 0)
+                kv_dominant_type = kv_unique[0].item() if len(kv_unique) > 0 else 0
+                if not kv_is_pure and len(kv_unique) > 0:
+                    # Get dominant non-zero type
+                    non_zero = kv_vals[kv_vals != 0]
+                    if len(non_zero) > 0:
+                        kv_unique_nonzero, kv_counts = torch.unique(non_zero, return_counts=True)
+                        kv_dominant_type = kv_unique_nonzero[kv_counts.argmax()].item()
+                
+                # Check if blocks overlap (for same-block detection)
+                blocks_overlap = not (kv_effective_end <= q_start or q_effective_end <= kv_start)
+                same_block = (q_block == kv_block)
+                
+                # Check if block pair crosses modality boundaries (PARTIAL case)
+                # This happens when:
+                # 1. Either block is mixed (contains multiple token types)
+                # 2. Blocks overlap and have different types
+                is_partial = False
+                if not q_is_pure or not kv_is_pure:
+                    is_partial = True
+                elif blocks_overlap and q_dominant_type != kv_dominant_type:
+                    is_partial = True
+                elif same_block and not q_is_pure:
+                    is_partial = True
+                
+                # Determine mask type based on dominant types and block properties
+                if is_partial:
+                    # PARTIAL: Block contains multiple types or crosses boundaries
+                    # Use conservative mask type based on dominant types
+                    if q_dominant_type == 0 and kv_dominant_type == 0:
+                        # Both text (dominant) - CAUSAL
+                        mask_type = BlockMaskType.PARTIAL  # Will need per-token check
+                    elif q_dominant_type > 0 and kv_dominant_type > 0:
+                        if q_dominant_type == kv_dominant_type:
+                            # Same modality but mixed - PARTIAL
+                            mask_type = BlockMaskType.PARTIAL
+                        elif kv_effective_end <= q_start:
+                            # KV before Q - PARTIAL (may have mixed content)
+                            mask_type = BlockMaskType.PARTIAL
+                        else:
+                            mask_type = BlockMaskType.MASKED
+                    else:
+                        # Mixed text/modality - PARTIAL
+                        mask_type = BlockMaskType.PARTIAL
+                elif q_dominant_type > 0 and kv_dominant_type > 0:
+                    # Both are pure modalities
+                    if q_dominant_type == kv_dominant_type:
                         # Same modality - FULL attention
                         mask_type = BlockMaskType.FULL
+                    elif kv_effective_end <= q_start:
+                        # KV is before Q - FULL (image can attend to all previous)
+                        mask_type = BlockMaskType.FULL
                     else:
-                        # Different modalities - check if KV is before Q
-                        if kv_end <= q_start:
-                            # KV is before Q - FULL (image can attend to all previous)
-                            mask_type = BlockMaskType.FULL
-                        else:
-                            # Different modalities, KV not before - MASKED
-                            mask_type = BlockMaskType.MASKED
-                elif q_type == 0 and kv_type > 0:
-                    # Q is text, KV is modality - CAUSAL only (text can't attend to future)
-                    if kv_end <= q_start:
+                        # Different modalities, KV not before - MASKED
+                        mask_type = BlockMaskType.MASKED
+                elif q_dominant_type == 0 and kv_dominant_type > 0:
+                    # Q is text, KV is modality
+                    if kv_effective_end <= q_start:
                         # KV is before Q - FULL (text can attend to past images)
                         mask_type = BlockMaskType.FULL
                     else:
                         # KV is after Q - MASKED (text is causal, can't see future)
                         mask_type = BlockMaskType.MASKED
-                elif q_type > 0 and kv_type == 0:
-                    # Q is modality, KV is text - FULL if KV is before Q
-                    if kv_end <= q_start:
+                elif q_dominant_type > 0 and kv_dominant_type == 0:
+                    # Q is modality, KV is text
+                    if kv_effective_end <= q_start:
                         mask_type = BlockMaskType.FULL
                     else:
                         mask_type = BlockMaskType.MASKED
                 else:
-                    # Both are text - STRICT CAUSAL (Q >= KV)
-                    if kv_end <= q_start:
+                    # Both are text (pure)
+                    if same_block:
+                        # Same block - CAUSAL (text within same block is causal)
+                        mask_type = BlockMaskType.CAUSAL
+                    elif kv_effective_end <= q_start:
                         # KV is entirely before Q - FULL
                         mask_type = BlockMaskType.FULL
-                    elif kv_start >= q_end:
-                        # KV is entirely after Q - MASKED
+                    elif q_effective_end <= kv_start:
+                        # Q is entirely before KV - MASKED
                         mask_type = BlockMaskType.MASKED
                     else:
-                        # Overlapping - CAUSAL (Q can attend to KV if Q >= KV)
-                        # For blocks, if they overlap, use CAUSAL
+                        # Overlapping blocks - CAUSAL
                         mask_type = BlockMaskType.CAUSAL
                 
                 if mask_type != BlockMaskType.MASKED:
@@ -836,8 +1246,8 @@ def create_omni_block_mask_from_modality_positions(
         kv_num_blocks=kv_num_blocks,
         kv_indices=kv_indices,
         block_mask_types=block_mask_types,
-        q_len=q_len,
-        kv_len=kv_len,
+        q_len=q_len_padded,  # Return padded length
+        kv_len=kv_len_padded,  # Return padded length
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
@@ -888,36 +1298,38 @@ def generate_random_input_with_modalities(
 
         is_last_segment = False
 
-        while not is_last_segment:
+        while current_length < N:
             remaining = N - current_length
             if remaining <= 0:
                 break
-            
-            # Alternate between text and image, either 0 or 1
-            text_or_image = torch.randint(0, 2, ()).item()
 
-            if text_in_row > 1:
+            if text_in_row >= 2:
                 text_or_image = 1
-            if image_in_row > 1:
+            elif image_in_row >= 2:
                 text_or_image = 0
-
+            else:
+                text_or_image = torch.randint(0, 2, ()).item()
+            
             if text_or_image == 0:
                 # Generate text segment
                 text_in_row += 1
                 image_in_row = 0
                 if remaining > max_text_len:
                     text_len = torch.randint(min_text_len, max_text_len + 1, (1,)).item()
-                elif remaining > min_text_len:
+                elif remaining >= min_text_len:
                     text_len = torch.randint(min_text_len, remaining + 1, (1,)).item()
                 else:
-                    is_last_segment = True
-                    break
+                    # Use all remaining tokens for text (even if < min_text_len)
+                    text_len = remaining
                 
                 text_tokens = randint(0, vocab_size, (text_len,), device=device)
                 batch_sample.append(text_tokens)
+                batch_modality_positions.append((1, offset, text_len))  # 1 = text modality
                 offset += text_len
                 current_length += text_len
-                print(f"text_len: {text_len}")
+                
+                if current_length >= N:
+                    break
             else:
                 # Generate image segment
                 image_in_row += 1
@@ -927,25 +1339,77 @@ def generate_random_input_with_modalities(
                 
                 if remaining > max_image_len:
                     image_len = torch.randint(min_image_len, max_image_len + 1, (1,)).item()
-                elif remaining > min_image_len:
+                elif remaining >= min_image_len:
                     image_len = torch.randint(min_image_len, remaining + 1, (1,)).item()
                 else:
-                    # image_len = remaining
-                    is_last_segment = True
-                    break
+                    # Use all remaining tokens for image (even if < min_image_len)
+                    # Find the closest valid h*w that fits
+                    image_len = remaining
+                    # Adjust to valid dimensions
+                    sqrt_tokens = max(1, int(image_len ** 0.5))
+                    h_size = max(1, min(sqrt_tokens, max_image_size))
+                    w_size = max(1, min(image_len // h_size, max_image_size))
+                    image_len = h_size * w_size
+                    # If still doesn't match, use remaining directly
+                    if image_len > remaining:
+                        image_len = remaining
+                        h_size = 1
+                        w_size = image_len
                 
-                # Find h, w such that h*w = image_len
-                sqrt_tokens = int(image_len ** 0.5)
-                h_size = max(min_image_size, min(sqrt_tokens, max_image_size))
-                w_size = max(min_image_size, min(image_len // h_size, max_image_size))
-                image_len = h_size * w_size
+                # Find h, w such that h*w = image_len (if not already set)
+                if image_len >= min_image_len:
+                    sqrt_tokens = int(image_len ** 0.5)
+                    h_size = max(min_image_size, min(sqrt_tokens, max_image_size))
+                    w_size = max(min_image_size, min(image_len // h_size, max_image_size))
+                    image_len = h_size * w_size
                 
                 image = randn(h_size, w_size, D, device=device)
                 batch_sample.append(image)
-                batch_modality_positions.append((0, offset, image_len))
+                batch_modality_positions.append((0, offset, image_len))  # 0 = image modality
                 offset += image_len
-                print(f"image_len: {image_len}")
                 current_length += image_len
+                
+                if current_length >= N:
+                    break
+        
+            print(f"text_or_image: ({'text' if text_or_image == 0 else 'image'}), current_length: {current_length}, remaining: {remaining}")
+
+        # Ensure we have exactly N tokens (pad if needed, truncate if over)
+        total_generated = sum(
+            len(item) if item.dim() == 1 else item.shape[0] * item.shape[1]
+            for item in batch_sample
+        )
+        
+        if total_generated < N:
+            # Pad with text tokens
+            pad_len = N - total_generated
+            pad_tokens = randint(0, vocab_size, (pad_len,), device=device)
+            batch_sample.append(pad_tokens)
+            # Note: Padding text is NOT added to modality_positions (text is default)
+        elif total_generated > N:
+            # Truncate last segment
+            excess = total_generated - N
+            last_item = batch_sample[-1]
+            if last_item.dim() == 1:
+                # Text: truncate
+                batch_sample[-1] = last_item[:len(last_item) - excess]
+                batch_modality_positions[-1] = (batch_modality_positions[-1][0], 
+                                                batch_modality_positions[-1][1],
+                                                batch_modality_positions[-1][2] - excess)
+            else:
+                # Image: adjust dimensions
+                h, w = last_item.shape[:2]
+                total_tokens = h * w
+                new_total = total_tokens - excess
+                # Find new h, w
+                sqrt_tokens = max(1, int(new_total ** 0.5))
+                new_h = max(1, min(sqrt_tokens, h))
+                new_w = max(1, min(new_total // new_h, w))
+                new_total = new_h * new_w
+                batch_sample[-1] = last_item[:new_h, :new_w]
+                batch_modality_positions[-1] = (batch_modality_positions[-1][0],
+                                                batch_modality_positions[-1][1],
+                                                new_total)
     
         text_and_images.append(batch_sample)
         all_modality_positions.append(batch_modality_positions)
@@ -966,6 +1430,102 @@ def generate_random_input_with_modalities(
     
     return text_and_images, modality_positions
 
+
+def generate_causal_input(
+    B: int,
+    N: int,
+    D: int,
+    device: Union[str, torch.device] = "cuda",
+) -> Tuple[List, Tensor]:
+    """Generate causal input with modalities.
+    
+    Creates a simple text-only input for causal attention testing.
+    
+    Args:
+        B: Batch size
+        N: Sequence length
+        D: Model dimension (not used, kept for compatibility)
+        device: Device
+        
+    Returns:
+        text_and_images: List of B samples, each with one text segment
+        modality_positions: [B, 1, 3] tensor of (modality_type, offset, length)
+    """
+    text_and_images = []
+    modality_positions = []
+
+    # one segment of each batch, which is causal
+    for b in range(B):
+        # Create text tokens (random integers)
+        text_tokens = torch.randint(0, 512, (N,), device=device, dtype=torch.long)
+        text_and_images.append([text_tokens])
+        modality_positions.append([(1, 0, N)])  # modality_type=1 (text), offset=0, length=N
+    
+    return text_and_images, torch.tensor(modality_positions, device=device)
+
+def create_causal_omni_block_mask(
+    batch: int,
+    nheads: int,
+    q_len: int,
+    kv_len: int,
+    BLOCK_SIZE: int = 128,
+    device: Union[str, torch.device] = "cuda",
+) -> OmniBlockMask:
+    """Create a simple causal mask in OmniBlockMask format.
+    
+    Pattern:
+    - Diagonal blocks: CAUSAL
+    - Below diagonal (left-bottom): FULL
+    - Above diagonal (top-right): MASKED
+    
+    Args:
+        batch: Batch size
+        nheads: Number of attention heads
+        q_len: Query sequence length (will be padded to BLOCK_SIZE multiple)
+        kv_len: Key/value sequence length (will be padded to BLOCK_SIZE multiple)
+        BLOCK_SIZE: Block size
+        device: Device
+        
+    Returns:
+        OmniBlockMask with causal attention pattern
+    """
+    # Pad to BLOCK_SIZE multiple
+    q_len_padded = ((q_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    kv_len_padded = ((kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    
+    num_q_blocks = q_len_padded // BLOCK_SIZE
+    num_kv_blocks = kv_len_padded // BLOCK_SIZE
+    max_blocks = num_kv_blocks  # Maximum number of KV blocks any Q block can attend to
+    
+    # Initialize tensors
+    kv_num_blocks = torch.zeros(batch, nheads, num_q_blocks, dtype=torch.int32, device=device)
+    kv_indices = torch.zeros(batch, nheads, num_q_blocks, max_blocks, dtype=torch.int32, device=device)
+    block_mask_types = torch.zeros(batch, nheads, num_q_blocks, max_blocks, dtype=torch.int32, device=device)
+    
+    for q_block in range(num_q_blocks):
+        num_active = 0
+        for kv_block in range(q_block + 1):
+            if kv_block < q_block:
+                # Below diagonal: FULL
+                mask_type = BlockMaskType.FULL
+            else:
+                # Diagonal: CAUSAL
+                mask_type = BlockMaskType.CAUSAL
+            
+            kv_indices[:, :, q_block, num_active] = kv_block
+            block_mask_types[:, :, q_block, num_active] = mask_type
+            num_active += 1
+        
+        kv_num_blocks[:, :, q_block] = num_active
+    
+    return OmniBlockMask(
+        kv_num_blocks=kv_num_blocks,
+        kv_indices=kv_indices,
+        block_mask_types=block_mask_types,
+        q_len=q_len_padded,
+        kv_len=kv_len_padded,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
 
 def get_embeddings_from_text_and_images(
     text_and_images: List,
@@ -1042,7 +1602,7 @@ def print_block_structure(
     Q4[294:380]=img1
 
     Mask (Q blocks: 4, F=FULL, C=CAUSAL, M=MASKED):
-    Q\KV   0  1  2  3  4
+    Q\\KV   0  1  2  3  4
     --------------------
     0   C  M  M  M  M
     1   F  C  M  M  M
@@ -1063,79 +1623,95 @@ def print_block_structure(
         mods = mods[sorted_indices]
     
     # Build list of all segments (text and image) in order
+    # Note: mod_type: 0 = image, 1 = text
     segments = []
     img_counter = 0
     
-    # Add text segment before first image (if any)
-    if len(mods) > 0:
-        first_img_start = int(mods[0, 1])
-        if first_img_start > 0:
-            segments.append(("text", 0, first_img_start))
-    
-    # Process each image and text segments between them
-    for i, (mod_type, mod_offset, mod_length) in enumerate(mods):
+    # Process each modality segment in order (already sorted by offset)
+    for mod_type, mod_offset, mod_length in mods:
+        mod_type = int(mod_type)
         mod_offset = int(mod_offset)
         mod_length = int(mod_length)
         mod_end = mod_offset + mod_length
         
-        # Add image segment
-        segments.append(("img", img_counter, mod_offset, mod_end))
-        img_counter += 1
-        
-        # Add text segment after this image (if not last)
-        if i < len(mods) - 1:
-            next_img_start = int(mods[i + 1, 1])
-            if next_img_start > mod_end:
-                segments.append(("text", mod_end, next_img_start))
+        if mod_type == 0:
+            # Image modality
+            segments.append(("img", img_counter, mod_offset, mod_end))
+            img_counter += 1
+        elif mod_type == 1:
+            # Text modality
+            segments.append(("text", mod_offset, mod_end))
+        # else: unknown type, skip
     
-    # Add final text segment (if any)
-    if len(mods) > 0:
-        last_img_end = int(mods[-1, 1] + mods[-1, 2])
-        if last_img_end < q_len:
-            segments.append(("text", last_img_end, q_len))
-    else:
-        # No images, all text
+    # Fill in any gaps (regions not covered by explicit modality segments)
+    # This handles padding or regions before/after all segments
+    if len(segments) == 0:
+        # No segments at all, assume all text
         if q_len > 0:
             segments.append(("text", 0, q_len))
-    
-    # Print modality ranges
-    print("Modality ranges: ", end="")
-    for seg in segments:
-        if seg[0] == "text":
-            start, end = seg[1], seg[2]
-            length = end - start
-            print(f"text[{start}:{end}] (len={length}) ", end="")
+    else:
+        # Check for gap before first segment
+        first_seg = segments[0]
+        if first_seg[0] == "text":
+            first_start = first_seg[1]
         else:
-            start, end = seg[2], seg[3]
-            length = end - start
-            img_idx = seg[1]
-            print(f"img{img_idx}[{start}:{end}] (len={length}) ", end="")
-    print()
+            first_start = first_seg[2]  # img: (name, idx, start, end)
+        if first_start > 0:
+            segments.insert(0, ("text", 0, first_start))
+        
+        # Check for gaps between segments
+        i = 0
+        while i < len(segments) - 1:
+            seg1 = segments[i]
+            seg2 = segments[i + 1]
+            
+            # Get end of seg1
+            if seg1[0] == "text":
+                seg1_end = seg1[2]
+            else:
+                seg1_end = seg1[3]  # img: (name, idx, start, end)
+            
+            # Get start of seg2
+            if seg2[0] == "text":
+                seg2_start = seg2[1]
+            else:
+                seg2_start = seg2[2]  # img: (name, idx, start, end)
+            
+            # If there's a gap, insert text segment
+            if seg2_start > seg1_end:
+                segments.insert(i + 1, ("text", seg1_end, seg2_start))
+                i += 2  # Skip the newly inserted segment
+            else:
+                i += 1
+        
+        # Check for gap after last segment
+        last_seg = segments[-1]
+        if last_seg[0] == "text":
+            last_end = last_seg[2]
+        else:
+            last_end = last_seg[3]  # img: (name, idx, start, end)
+        if last_end < q_len:
+            segments.append(("text", last_end, q_len))
     
     # Print block types (each segment is a block)
     print("Block types:")
     for q_idx, seg in enumerate(segments):
         if seg[0] == "text":
             start, end = seg[1], seg[2]
-            print(f"Q{q_idx}[{start}:{end}]=text")
+            print(f"Q{q_idx}[{start}:{end}]=text, len={end-start}")
         else:
             start, end = seg[2], seg[3]
             img_idx = seg[1]
-            print(f"Q{q_idx}[{start}:{end}]=img{img_idx}")
+            print(f"Q{q_idx}[{start}:{end}]=img{img_idx}, len={end-start}")
     
     # Print mask based on segment types and positions
     num_q_blocks = len(segments)
     print(f"Mask (Q blocks: {num_q_blocks}, F=FULL, C=CAUSAL, M=MASKED):")
-    print("Q\\KV  ", end="")
+    print(r"Q\KV  ", end="")
     for kv_block in range(num_q_blocks):
         print(f"{kv_block:2d} ", end="")
     print()
     print("-" * (6 + 3 * num_q_blocks))
-    
-    # Determine mask type for each segment pair based on rules:
-    # - Text segments: CAUSAL attention (can attend to previous text, same segment)
-    # - Image modalities: FULL attention within same modality, FULL to all previous tokens
-    # - Different image modalities: MASKED (no attention between different images, unless KV is before Q)
     
     for q_seg_idx in range(num_q_blocks):
         q_seg = segments[q_seg_idx]
@@ -1156,51 +1732,31 @@ def print_block_structure(
             else:
                 kv_start, kv_end = kv_seg[2], kv_seg[3]
                 kv_img_idx = kv_seg[1]
-            
-            # Determine mask type based on segment positions
-            # Rules:
-            # - Text can attend to all previous tokens (text and image) with FULL
-            # - Text within same segment: CAUSAL
-            # - Text cannot attend to future tokens: MASKED
-            # - Image can attend to all previous tokens: FULL
-            # - Image same modality: FULL
-            # - Image cannot attend to future different images: MASKED
+ 
             
             if q_is_text and kv_is_text:
-                # Text to text
                 if q_seg_idx == kv_seg_idx:
-                    # Same text segment: CAUSAL
                     mask_type = BlockMaskType.CAUSAL
                 elif kv_end <= q_start:
-                    # Previous text segment: FULL
                     mask_type = BlockMaskType.FULL
                 else:
-                    # Future text segment: MASKED
                     mask_type = BlockMaskType.MASKED
             elif not q_is_text and kv_is_text:
-                # Image to text: FULL if text is before image
                 if kv_end <= q_start:
                     mask_type = BlockMaskType.FULL
                 else:
                     mask_type = BlockMaskType.MASKED
             elif q_is_text and not kv_is_text:
-                # Text to image
                 if kv_end <= q_start:
-                    # Previous image: FULL (text can attend to previous images)
                     mask_type = BlockMaskType.FULL
                 else:
-                    # Future image: MASKED
                     mask_type = BlockMaskType.MASKED
             else:
-                # Image to image
                 if q_img_idx == kv_img_idx:
-                    # Same image: FULL
                     mask_type = BlockMaskType.FULL
                 elif kv_end <= q_start:
-                    # Previous different image: FULL
                     mask_type = BlockMaskType.FULL
                 else:
-                    # Future different image: MASKED
                     mask_type = BlockMaskType.MASKED
             
             if mask_type == BlockMaskType.FULL:

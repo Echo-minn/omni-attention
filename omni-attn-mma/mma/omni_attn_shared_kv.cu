@@ -612,7 +612,7 @@ omni_attn_mma_blockmask(
 void omni_attn_mma_stages_split_q_shared_kv(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int stages) {
+    torch::Tensor block_mask_types, int stages, int BLOCK_SIZE) {
   
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
@@ -624,10 +624,21 @@ void omni_attn_mma_stages_split_q_shared_kv(
   const int seqlen = Q.size(2);
   const int head_dim = Q.size(3);
   
-  // Get BLOCK_SIZE from block mask (infer from tensor shapes)
+  // Use BLOCK_SIZE from block mask (must match the BLOCK_SIZE used to create the mask)
   const int num_q_blocks = kv_num_blocks.size(2);
-  const int Q_BLOCK_SIZE = div_ceil(seqlen, num_q_blocks);
-  const int KV_BLOCK_SIZE = Q_BLOCK_SIZE; // Assume same for now
+  
+  // Validate BLOCK_SIZE matches expected value
+  const int expected_num_q_blocks = (seqlen + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  if (num_q_blocks != expected_num_q_blocks) {
+    throw std::runtime_error(
+        "Block mask num_q_blocks (" + std::to_string(num_q_blocks) + 
+        ") does not match expected value (" + std::to_string(expected_num_q_blocks) + 
+        ") based on seqlen=" + std::to_string(seqlen) + " and BLOCK_SIZE=" + 
+        std::to_string(BLOCK_SIZE));
+  }
+  
+  const int Q_BLOCK_SIZE = BLOCK_SIZE;
+  const int KV_BLOCK_SIZE = BLOCK_SIZE; // Assume same for now
   
   // Validate head_dim is supported
   if (head_dim != 32 && head_dim != 64 && head_dim != 128) {

@@ -39,7 +39,11 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 # Source files
 sources = [
     os.path.join(this_dir, "pybind", "omni_attn.cc"),
-    os.path.join(this_dir, "mma", "omni_attn.cu"),
+    os.path.join(this_dir, "mma", "attn_naive.cu"),
+    os.path.join(this_dir, "mma", "omni_attn_cp_async.cu"),
+    os.path.join(this_dir, "mma", "omni_attn_preftech.cu"),
+    os.path.join(this_dir, "mma", "omni_attn_swizzle.cu"),
+    os.path.join(this_dir, "mma", "omni_attn_shared_kv.cu"),
 ]
 
 # Include directories
