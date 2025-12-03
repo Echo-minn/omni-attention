@@ -24,13 +24,21 @@ void omni_attn_cp_async(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor kv_indices,
                                              torch::Tensor block_mask_types,
                                              int BLOCK_SIZE,
-                                             int seqlen_orig);
+                                             int seqlen_orig,
+                                             torch::Tensor partial_block_mask_indices,
+                                             torch::Tensor partial_block_masks,
+                                             bool has_partial);
 
 void omni_attn_preftech_kernel(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor V, torch::Tensor O,
                                              torch::Tensor kv_num_blocks,
                                              torch::Tensor kv_indices,
-                                             torch::Tensor block_mask_types);
+                                             torch::Tensor block_mask_types,
+                                             int BLOCK_SIZE,
+                                             int seqlen_orig,
+                                             torch::Tensor partial_block_mask_indices,
+                                             torch::Tensor partial_block_masks,
+                                             bool has_partial);
 
 void omni_attn_mma_stages_split_q_shared_kv(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor V, torch::Tensor O,
@@ -38,7 +46,11 @@ void omni_attn_mma_stages_split_q_shared_kv(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor kv_indices,
                                              torch::Tensor block_mask_types,
                                              int stages,
-                                             int BLOCK_SIZE);
+                                             int BLOCK_SIZE,
+                                             int seqlen_orig,
+                                             torch::Tensor partial_block_mask_indices,
+                                             torch::Tensor partial_block_masks,
+                                             bool has_partial);
 
 void omni_attn_swizzle_kernel(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor V, torch::Tensor O,

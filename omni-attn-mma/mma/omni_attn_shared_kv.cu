@@ -1,26 +1,11 @@
 #include "utils.h"
 
-// Note: Block mask creation is handled in Python (omni_attn_torch.py)
-// The create_block_mask function below is a placeholder/stub and not currently used.
-// If needed in the future, it should be implemented to create block masks from modality_positions.
-/*
-tuple<torch::Tensor, torch::Tensor> create_block_mask(torch::Tensor modality_positions, int Q_BLOCK_SIZE, int KV_BLOCK_SIZE) {
-  // modality_positions: [B, M, 3] tensor of (modality_type, offset, length)
-
-  // return kv_num_blocks (Tensor): Number of kv_blocks in each Q_BLOCK_SIZE row tile.
-  // return kv_indices (Tensor): Indices of key-value blocks in each Q_BLOCK_SIZE row tile.
-  // return block_mask_types (Tensor): Mask type per block: 0=CAUSAL, 1=PARTIAL, 2=FULL,
-  // masked out blocks will not be included in the kv_indices tensor. so every item kv_num_blocks need to be load and computed.
-
-  // TODO: Implement block mask creation from modality_positions
-  // For now, block masks are created in Python via create_omni_block_mask_from_modality_positions()
-  throw std::runtime_error("create_block_mask not yet implemented in CUDA");
-}
-*/
+// Note
 // Block mask type definitions
 #define BLOCK_MASK_MASKED 0
 #define BLOCK_MASK_CAUSAL 1
 #define BLOCK_MASK_FULL 2
+#define BLOCK_MASK_PARTIAL 3  // Requires per-token dense mask check
 
 template <
   const int kHeadDim,          // Headdim, 32,64,128
@@ -46,15 +31,18 @@ template <
   const int kPadQ,               // Pad Q/K/V 0,8
   const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
-omni_attn_mma_blockmask(
+omni_attn_shared_kv(
     half *Q, half *K, half *V, half *O,
     int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     const int *kv_num_blocks, const int *kv_indices, 
     const int *block_mask_types,
-    int QKV_seqlen, int QKV_head, int QKV_batch,
+    const int *partial_block_mask_indices,
+    const bool *partial_block_masks,
+    int QKV_seqlen, int QKV_seqlen_orig, int QKV_head, int QKV_batch,
     int kv_num_blocks_stride0, int kv_num_blocks_stride1, int kv_num_blocks_stride2,
     int kv_indices_stride0, int kv_indices_stride1, int kv_indices_stride2, int kv_indices_stride3,
-    int block_mask_types_stride0, int block_mask_types_stride1, int block_mask_types_stride2, int block_mask_types_stride3) {
+    int block_mask_types_stride0, int block_mask_types_stride1, int block_mask_types_stride2, int block_mask_types_stride3,
+    bool has_partial_masks) {
   
   static_assert(kMmaAtomM == 16 && kMmaAtomN == 8 && kMmaAtomK == 16);                                 // m16n8k16
   static_assert(kMmaTileSeqLenQ <= 8 && kMmaTileSeqLenK == 1);    // Q@K^T
@@ -73,37 +61,7 @@ omni_attn_mma_blockmask(
   constexpr int kNumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK; // 32*4*1=128, num threads
   const float scale = 1.0f / sqrt((float)kHeadDim);
 
-  // ============================================================================
-  // CRITICAL: Block Mask Alignment Requirement
-  // ============================================================================
-  // The block mask uses Q_BLOCK_SIZE and KV_BLOCK_SIZE to define blocks.
-  // The kernel processes tiles of size Br and Bc (computed from MMA parameters).
-  // 
-  // ALIGNMENT REQUIREMENT: Br == Q_BLOCK_SIZE AND Bc == KV_BLOCK_SIZE
-  //
-  // Why this matters:
-  // - Block mask block i corresponds to Q positions [i*Q_BLOCK_SIZE, (i+1)*Q_BLOCK_SIZE)
-  // - Kernel tile j processes Q positions [j*Br, (j+1)*Br)
-  // - If Br != Q_BLOCK_SIZE, then Q_tile_id won't align with block mask blocks
-  // - This causes incorrect block mask lookups and wrong results!
-  //
-  // Example of misalignment problem:
-  //   If Br=64, Q_BLOCK_SIZE=128:
-  //   - Kernel tile 0 processes Q[0:64], but uses block mask block 0 (expects Q[0:128])
-  //   - Kernel tile 1 processes Q[64:128], but uses block mask block 1 (expects Q[128:256])
-  //   - Result: Wrong mask applied, incorrect attention computation
-  //
-  // Solution: Ensure template parameters are chosen so that:
-  //   Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ == Q_BLOCK_SIZE
-  //   Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK == KV_BLOCK_SIZE
-  //
-  // Runtime check (should be caught by launch wrapper, but defensive check here):
   if (Br != Q_BLOCK_SIZE || Bc != KV_BLOCK_SIZE) {
-    // This indicates a configuration error - the kernel template parameters
-    // don't match the block mask block sizes. This will cause incorrect results.
-    // The launch wrapper should validate this before calling the kernel.
-    // For now, we return early to avoid crashes, but this should never happen
-    // if the kernel is launched correctly.
     return;
   }
 
@@ -113,10 +71,6 @@ omni_attn_mma_blockmask(
   const int Q_tile_id = blockIdx.x;               // Q tile_id, range [0, Tr]
   const int O_tile_id = Q_tile_id;                // O tile_id, same as Q.
   
-  // Map Q_tile_id to block mask block index
-  // Since we enforce Br == Q_BLOCK_SIZE, this is a 1:1 mapping
-  // If we support Br != Q_BLOCK_SIZE in the future, we'd need:
-  // int q_block = (Q_tile_id * Br) / Q_BLOCK_SIZE;
   const int q_block = Q_tile_id; // Only valid when Br == Q_BLOCK_SIZE
   const int tid = threadIdx.x;                    // within block
   const int warp_id = tid / WARP_SIZE;            // 0~7 warp_id within block
@@ -159,14 +113,11 @@ omni_attn_mma_blockmask(
   fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_max_old, -INFINITY);
   fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_block_row_sum_old, 0.0f);
 
-  constexpr bool kCanPrefetchQs2r = ((kHeadDim / kMmaAtomK) <= 8) && (kHeadDim < 64);
-  constexpr bool kDelayPrefetchQs2r = (true && kCanPrefetchQs2r);
-  constexpr bool kCanPrefetchKVg2s = (kStage == 2); // whether prefetch KV g2s.
-  constexpr int kPrefetchKg2sSmemId = 0;            // smem id for K g2s, 0.
-  constexpr int kPrefetchVg2sSmemId = kCanPrefetchKVg2s ? 1 : 0; // smem id for V g2s, 1.
-  constexpr int kNumPrefetchQs2r = (kCanPrefetchQs2r) ? (kHeadDim / kMmaAtomK) : 1;
+  // No prefetch support - only shared KV (sequential K/V loading)
+  // K and V share the same smem buffer, V overwrites K after K is used
+  constexpr int kNumPrefetchQs2r = 1; // Always load Q on-demand
 
-  uint32_t R_Q[kNumPrefetchQs2r][kWarpTileSeqLenQ][4]; // [4/8/1][1][4]
+  uint32_t R_Q[kNumPrefetchQs2r][kWarpTileSeqLenQ][4]; // [1][1][4]
   uint32_t R_K[kWarpTileSeqLenK][2];                   // [8][2]
   uint32_t R_V[kWarpTileHeadDimV][2];
   uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][2];
@@ -211,9 +162,24 @@ omni_attn_mma_blockmask(
       continue;
     }
 
+    // Get partial block index if needed
+    int partial_block_index = -1;
+    if (mask_type == BLOCK_MASK_PARTIAL) {
+      if (!has_partial_masks || partial_block_mask_indices == nullptr) {
+        continue;
+      }
+      partial_block_index = partial_block_mask_indices[QKV_batch_id * block_mask_types_stride0 +
+                                                       QKV_head_id * block_mask_types_stride1 +
+                                                       q_block * block_mask_types_stride2 +
+                                                       kv_idx * block_mask_types_stride3];
+      if (partial_block_index < 0) {
+        continue;
+      }
+    }
+
     // Compute KV block boundaries
     int kv_block_start = kv_block * KV_BLOCK_SIZE;
-    int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, QKV_seqlen);
+    int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, QKV_seqlen_orig);
     
     // for each KV block(KV_BLOCK_SIZE)
     // load K from gmem -> smem
@@ -237,78 +203,19 @@ omni_attn_mma_blockmask(
     CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
-    // Prefetch V if stage 2
-    if constexpr (kCanPrefetchKVg2s) {
-      int load_gmem_V_Bc = kv_block_start + load_smem_V_Bc;
-      if (load_smem_V_Bc < Bc && load_gmem_V_Bc < kv_block_end) {
-        int load_gmem_V_d = load_smem_V_d;
-        int load_gmem_V_addr = (V_gmem_offset + load_gmem_V_Bc * kHeadDim + load_gmem_V_d);
-        uint32_t load_smem_V_ptr = (smem_V_base_ptr + (kPrefetchVg2sSmemId * V_tile_size + load_smem_V_Bc * (kHeadDim + kPadV) + load_smem_V_d) * sizeof(half));
-        #pragma unroll
-        for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-          CP_ASYNC_CG(load_smem_V_ptr + i * 2, &V[load_gmem_V_addr + i], 16);
-        }
-        CP_ASYNC_COMMIT_GROUP();
-      }
-    }
-
-    // Prefetch Q from smem -> regs if enabled
-    if constexpr (kCanPrefetchQs2r && (!kDelayPrefetchQs2r)) {
-      if (kv_idx == 0) {
-        CP_ASYNC_WAIT_GROUP(0);
-        if constexpr (kCanPrefetchKVg2s) {
-          CP_ASYNC_WAIT_GROUP(1);
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-          #pragma unroll
-          for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-            int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-            int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-            int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-            uint32_t lane_smem_Q_ptr = (smem_Q_base_ptr + (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) * sizeof(half));
-            LDMATRIX_X4(R_Q[tile_K_d][i][0], R_Q[tile_K_d][i][1], R_Q[tile_K_d][i][2], R_Q[tile_K_d][i][3], lane_smem_Q_ptr);
-          }
-        }
-        __syncthreads();
-      }
-    }
-
     // compute S = Q @ K^T
     // compute with multiple MMA tiles(m16n8k16)
     fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
     #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
       // load Q from smem to registers (m16k16)
-      if constexpr (!kCanPrefetchQs2r) {
-        #pragma unroll
-        for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-          int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-          int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-          int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-          uint32_t lane_smem_Q_ptr = (smem_Q_base_ptr + (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) * sizeof(half));
-          LDMATRIX_X4(R_Q[0][i][0], R_Q[0][i][1], R_Q[0][i][2], R_Q[0][i][3], lane_smem_Q_ptr);
-        }
-      } else if constexpr (kDelayPrefetchQs2r) {
-        if (kv_idx == 0 && tile_K_d == 0) {
-          CP_ASYNC_WAIT_GROUP(0);
-          if constexpr (kCanPrefetchKVg2s) {
-            CP_ASYNC_WAIT_GROUP(1);
-          }
-          __syncthreads();
-        }
-        if (kv_idx == 0) {
-          #pragma unroll
-          for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-            int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-            int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-            int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-            uint32_t lane_smem_Q_ptr = (smem_Q_base_ptr + (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) * sizeof(half));
-            LDMATRIX_X4(R_Q[tile_K_d][i][0], R_Q[tile_K_d][i][1], R_Q[tile_K_d][i][2], R_Q[tile_K_d][i][3], lane_smem_Q_ptr);
-          }
-        }
+      #pragma unroll
+      for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
+        int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
+        int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
+        int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
+        uint32_t lane_smem_Q_ptr = (smem_Q_base_ptr + (lane_smem_Q_Br * (kHeadDim + kPadQ) + lane_smem_Q_d) * sizeof(half));
+        LDMATRIX_X4(R_Q[0][i][0], R_Q[0][i][1], R_Q[0][i][2], R_Q[0][i][3], lane_smem_Q_ptr);
       }
 
       // load K from smem to registers (k16n8)
@@ -322,16 +229,9 @@ omni_attn_mma_blockmask(
       }
 
       // MMA computation: R_S += R_Q @ R_K^T (m16n8k16)
-      if constexpr (kCanPrefetchQs2r) {
-        #pragma unroll
-        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-          HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[tile_K_d][0][0], R_Q[tile_K_d][0][1], R_Q[tile_K_d][0][2], R_Q[tile_K_d][0][3], R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1]);
-        }
-      } else {
-        #pragma unroll
-        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-          HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3], R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1]);
-        }
+      #pragma unroll
+      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+        HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3], R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1]);
       }
     }
     __syncthreads();
@@ -367,8 +267,76 @@ omni_attn_mma_blockmask(
       }
     }
 
-    // Load V if not prefetched
-    if constexpr (!kCanPrefetchKVg2s) {
+    // Apply partial mask if needed
+    if (mask_type == BLOCK_MASK_PARTIAL && has_partial_masks && partial_block_masks != nullptr) {
+      int q_base = Q_tile_id * Br;
+      int kv_base = kv_block * KV_BLOCK_SIZE;
+      int q_block_start = q_block * Q_BLOCK_SIZE;
+      int row_in_tile = lane_id % 8;
+      int col_pair = (lane_id / 8) * 2;
+      const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
+      
+      #pragma unroll
+      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+        int q_row_0 = q_base + row_in_tile;
+        int q_row_1 = q_base + row_in_tile + 8;
+        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair;
+        int kv_col_1 = kv_col_0 + 1;
+        
+        half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
+        
+        // Check mask for (q_row_0, kv_col_0)
+        if (q_row_0 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
+          int local_q_0 = q_row_0 - q_block_start;
+          int local_kv_0 = kv_col_0 - kv_base;
+          if (local_q_0 >= 0 && local_q_0 < Q_BLOCK_SIZE && local_kv_0 >= 0 && local_kv_0 < KV_BLOCK_SIZE) {
+            int mask_offset_0 = partial_block_index * block_area + local_q_0 * KV_BLOCK_SIZE + local_kv_0;
+            if (!partial_block_masks[mask_offset_0]) {
+              S[0] = __float2half(-INFINITY);
+            }
+          }
+        }
+        
+        // Check mask for (q_row_0, kv_col_1)
+        if (q_row_0 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
+          int local_q_0 = q_row_0 - q_block_start;
+          int local_kv_1 = kv_col_1 - kv_base;
+          if (local_q_0 >= 0 && local_q_0 < Q_BLOCK_SIZE && local_kv_1 >= 0 && local_kv_1 < KV_BLOCK_SIZE) {
+            int mask_offset_1 = partial_block_index * block_area + local_q_0 * KV_BLOCK_SIZE + local_kv_1;
+            if (!partial_block_masks[mask_offset_1]) {
+              S[1] = __float2half(-INFINITY);
+            }
+          }
+        }
+        
+        // Check mask for (q_row_1, kv_col_0)
+        if (q_row_1 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
+          int local_q_1 = q_row_1 - q_block_start;
+          int local_kv_0 = kv_col_0 - kv_base;
+          if (local_q_1 >= 0 && local_q_1 < Q_BLOCK_SIZE && local_kv_0 >= 0 && local_kv_0 < KV_BLOCK_SIZE) {
+            int mask_offset_2 = partial_block_index * block_area + local_q_1 * KV_BLOCK_SIZE + local_kv_0;
+            if (!partial_block_masks[mask_offset_2]) {
+              S[2] = __float2half(-INFINITY);
+            }
+          }
+        }
+        
+        // Check mask for (q_row_1, kv_col_1)
+        if (q_row_1 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
+          int local_q_1 = q_row_1 - q_block_start;
+          int local_kv_1 = kv_col_1 - kv_base;
+          if (local_q_1 >= 0 && local_q_1 < Q_BLOCK_SIZE && local_kv_1 >= 0 && local_kv_1 < KV_BLOCK_SIZE) {
+            int mask_offset_3 = partial_block_index * block_area + local_q_1 * KV_BLOCK_SIZE + local_kv_1;
+            if (!partial_block_masks[mask_offset_3]) {
+              S[3] = __float2half(-INFINITY);
+            }
+          }
+        }
+      }
+    }
+
+    // Load V from gmem -> smem (overwrites K's smem after K is used)
+    {
       int load_gmem_V_Bc = kv_block_start + load_smem_V_Bc;
       if (load_smem_V_Bc < Bc && load_gmem_V_Bc < kv_block_end) {
         int load_gmem_V_d = load_smem_V_d;
@@ -380,10 +348,8 @@ omni_attn_mma_blockmask(
         }
         CP_ASYNC_COMMIT_GROUP();
       }
-      CP_ASYNC_WAIT_GROUP(0);
-    } else {
-      CP_ASYNC_WAIT_GROUP(1);
     }
+    CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
     // compute P = softmax(S)
@@ -444,13 +410,13 @@ omni_attn_mma_blockmask(
     fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 2>(R_O, 0);
     #pragma unroll
     for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
-      // load V from smem to registers (k16n8)
+      // load V from smem to registers (k16n8, transposed)
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
         int warp_smem_V_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
         int lane_smem_V_Bc = tile_V_Bc * kMmaAtomK + lane_id % 16;
         int lane_smem_V_d = warp_smem_V_d;
-        uint32_t lane_smem_V_ptr = (smem_V_base_ptr + (kPrefetchVg2sSmemId * V_tile_size + lane_smem_V_Bc * (kHeadDim + kPadV) + lane_smem_V_d) * sizeof(half));
+        uint32_t lane_smem_V_ptr = (smem_V_base_ptr + (lane_smem_V_Bc * (kHeadDim + kPadV) + lane_smem_V_d) * sizeof(half));
         LDMATRIX_X2_T(R_V[j][0], R_V[j][1], lane_smem_V_ptr);
       }
 
@@ -586,7 +552,7 @@ omni_attn_mma_blockmask(
 // 1,1,1,1,1,1,1,1,
 // 1,1,1,1,1,1,1,1]
 
-// vlm mask
+// partial mask
 // [1,0,0,0,0,0,0,0,
 // 1,1,0,0,0,0,0,0,
 // 1,1,1,1,1,0,0,0,
@@ -612,7 +578,10 @@ omni_attn_mma_blockmask(
 void omni_attn_mma_stages_split_q_shared_kv(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int stages, int BLOCK_SIZE) {
+    torch::Tensor block_mask_types, int stages, int BLOCK_SIZE,
+    int seqlen_orig,
+    torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
+    bool has_partial) {
   
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
@@ -647,12 +616,9 @@ void omni_attn_mma_stages_split_q_shared_kv(
         ". Supported values: 32, 64, 128");
   }
   
-  // Validate stages
-  if (stages != 1 && stages != 2) {
-    throw std::runtime_error(
-        "Unsupported stages=" + std::to_string(stages) +
-        ". Supported values: 1, 2");
-  }
+  // Always use stage 1 (no prefetch, shared KV only)
+  // Prefetch support removed - would require double-buffering to avoid smem conflicts
+  constexpr int kStage = 1;
   
   // Validate BLOCK_SIZE is supported (64 or 128)
   if (Q_BLOCK_SIZE != 64 && Q_BLOCK_SIZE != 128) {
@@ -665,6 +631,27 @@ void omni_attn_mma_stages_split_q_shared_kv(
         "Unsupported KV_BLOCK_SIZE=" + std::to_string(KV_BLOCK_SIZE) +
         ". Supported values: 64, 128");
   }
+  
+  // Validate partial masks if provided
+  const bool has_partial_masks = has_partial;
+  if (has_partial_masks) {
+    if (!partial_block_mask_indices.is_contiguous() ||
+        !partial_block_masks.is_contiguous()) {
+      throw std::runtime_error(
+          "Partial block mask tensors must be contiguous.");
+    }
+    CHECK_TORCH_TENSOR_DTYPE(partial_block_mask_indices, torch::kInt32)
+    CHECK_TORCH_TENSOR_DTYPE(partial_block_masks, torch::kBool)
+  }
+  
+  const int *partial_idx_ptr = has_partial_masks
+                                   ? reinterpret_cast<int *>(
+                                         partial_block_mask_indices.data_ptr())
+                                   : nullptr;
+  const bool *partial_masks_ptr = has_partial_masks
+                                      ? reinterpret_cast<bool *>(
+                                            partial_block_masks.data_ptr())
+                                      : nullptr;
   
   // Select template parameters based on BLOCK_SIZE
   // For BLOCK_SIZE=64: Br=64=16*4*1, Bc=64=8*1*8
@@ -694,7 +681,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
     dim3 grid(div_ceil(seqlen, Br), batch * heads);
     dim3 block(kNumThreads);
     
-    if (head_dim == 32 && stages == 1) {
+    if (head_dim == 32) {
       constexpr int kHeadDim = 32;
       constexpr int kWarpTileHeadDimV = 4; // 32 / (8 * 1)
       constexpr int kStage = 1;
@@ -702,7 +689,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -711,34 +698,15 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 32 && stages == 2) {
-      constexpr int kHeadDim = 32;
-      constexpr int kWarpTileHeadDimV = 4;
-      constexpr int kStage = 2;
-      constexpr int Q_tile_size = Br * (kHeadDim + kPadQ);
-      constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
-      constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
-      constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
-          kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
-          <<<grid, block, smem_size>>>(reinterpret_cast<half *>(Q.data_ptr()),
-              reinterpret_cast<half *>(K.data_ptr()), reinterpret_cast<half *>(V.data_ptr()),
-              reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-              reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
-              reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
-              kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
-              kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
-              block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 64 && stages == 1) {
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
+    } else if (head_dim == 64) {
       constexpr int kHeadDim = 64;
       constexpr int kWarpTileHeadDimV = 8; // 64 / (8 * 1)
       constexpr int kStage = 1;
@@ -746,7 +714,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -755,34 +723,15 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 64 && stages == 2) {
-      constexpr int kHeadDim = 64;
-      constexpr int kWarpTileHeadDimV = 8;
-      constexpr int kStage = 2;
-      constexpr int Q_tile_size = Br * (kHeadDim + kPadQ);
-      constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
-      constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
-      constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
-          kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
-          <<<grid, block, smem_size>>>(reinterpret_cast<half *>(Q.data_ptr()),
-              reinterpret_cast<half *>(K.data_ptr()), reinterpret_cast<half *>(V.data_ptr()),
-              reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-              reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
-              reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
-              kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
-              kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
-              block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 128 && stages == 1) {
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
+    } else if (head_dim == 128) {
       constexpr int kHeadDim = 128;
       constexpr int kWarpTileHeadDimV = 16; // 128 / (8 * 1)
       constexpr int kStage = 1;
@@ -790,7 +739,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -799,37 +748,17 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 128 && stages == 2) {
-      constexpr int kHeadDim = 128;
-      constexpr int kWarpTileHeadDimV = 16;
-      constexpr int kStage = 2;
-      constexpr int Q_tile_size = Br * (kHeadDim + kPadQ);
-      constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
-      constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
-      constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
-          kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
-          <<<grid, block, smem_size>>>(reinterpret_cast<half *>(Q.data_ptr()),
-              reinterpret_cast<half *>(K.data_ptr()), reinterpret_cast<half *>(V.data_ptr()),
-              reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-              reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
-              reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
-              kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
-              kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
-              block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
     } else {
       throw std::runtime_error(
-          "Unsupported configuration for BLOCK_SIZE=64: head_dim=" + std::to_string(head_dim) +
-          ", stages=" + std::to_string(stages));
+          "Unsupported configuration for BLOCK_SIZE=64: head_dim=" + std::to_string(head_dim));
     }
   } else if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 128) {
     // BLOCK_SIZE=128 configuration
@@ -843,7 +772,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
     dim3 grid(div_ceil(seqlen, Br), batch * heads);
     dim3 block(kNumThreads);
     
-    if (head_dim == 32 && stages == 1) {
+    if (head_dim == 32) {
       constexpr int kHeadDim = 32;
       constexpr int kWarpTileHeadDimV = 4; // 32 / (8 * 1)
       constexpr int kStage = 1;
@@ -851,7 +780,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -860,34 +789,15 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 32 && stages == 2) {
-      constexpr int kHeadDim = 32;
-      constexpr int kWarpTileHeadDimV = 4;
-      constexpr int kStage = 2;
-      constexpr int Q_tile_size = Br * (kHeadDim + kPadQ);
-      constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
-      constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
-      constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
-          kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
-          <<<grid, block, smem_size>>>(reinterpret_cast<half *>(Q.data_ptr()),
-              reinterpret_cast<half *>(K.data_ptr()), reinterpret_cast<half *>(V.data_ptr()),
-              reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-              reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
-              reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
-              kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
-              kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
-              block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 64 && stages == 1) {
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
+    } else if (head_dim == 64) {
       constexpr int kHeadDim = 64;
       constexpr int kWarpTileHeadDimV = 8; // 64 / (8 * 1)
       constexpr int kStage = 1;
@@ -895,7 +805,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -904,34 +814,15 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 64 && stages == 2) {
-      constexpr int kHeadDim = 64;
-      constexpr int kWarpTileHeadDimV = 8;
-      constexpr int kStage = 2;
-      constexpr int Q_tile_size = Br * (kHeadDim + kPadQ);
-      constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
-      constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
-      constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
-          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
-          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
-          kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
-          <<<grid, block, smem_size>>>(reinterpret_cast<half *>(Q.data_ptr()),
-              reinterpret_cast<half *>(K.data_ptr()), reinterpret_cast<half *>(V.data_ptr()),
-              reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-              reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
-              reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
-              kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
-              kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
-              block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
-    } else if (head_dim == 128 && stages == 1) {
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
+    } else if (head_dim == 128) {
       constexpr int kHeadDim = 128;
       constexpr int kWarpTileHeadDimV = 16; // 128 / (8 * 1)
       constexpr int kStage = 1;
@@ -939,7 +830,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -948,11 +839,14 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
     } else if (head_dim == 128 && stages == 2) {
       constexpr int kHeadDim = 128;
       constexpr int kWarpTileHeadDimV = 16;
@@ -961,7 +855,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
-      omni_attn_mma_blockmask<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>
@@ -970,15 +864,17 @@ void omni_attn_mma_stages_split_q_shared_kv(
               reinterpret_cast<half *>(O.data_ptr()), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
               reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
               reinterpret_cast<int *>(kv_indices.data_ptr()),
-              reinterpret_cast<int *>(block_mask_types.data_ptr()), seqlen, heads, batch,
+              reinterpret_cast<int *>(block_mask_types.data_ptr()),
+              partial_idx_ptr, partial_masks_ptr,
+              seqlen, seqlen_orig, heads, batch,
               kv_num_blocks.stride(0), kv_num_blocks.stride(1), kv_num_blocks.stride(2),
               kv_indices.stride(0), kv_indices.stride(1), kv_indices.stride(2), kv_indices.stride(3),
               block_mask_types.stride(0), block_mask_types.stride(1),
-              block_mask_types.stride(2), block_mask_types.stride(3));
+              block_mask_types.stride(2), block_mask_types.stride(3),
+              has_partial_masks);
     } else {
       throw std::runtime_error(
-          "Unsupported configuration for BLOCK_SIZE=128: head_dim=" + std::to_string(head_dim) +
-          ", stages=" + std::to_string(stages));
+          "Unsupported configuration for BLOCK_SIZE=128: head_dim=" + std::to_string(head_dim));
     }
   } else {
     throw std::runtime_error(

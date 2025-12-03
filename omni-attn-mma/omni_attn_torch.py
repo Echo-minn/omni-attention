@@ -628,6 +628,15 @@ def omni_attention_mma(
             f"Please use --block_size 64 or --block_size 128."
         )
     
+    # TODO: Get partial mask information
+    has_partial = (block_mask.partial_block_mask_indices is not None and 
+                   block_mask.partial_block_masks is not None)
+    partial_block_mask_indices = None
+    partial_block_masks = None
+    if has_partial:
+        partial_block_mask_indices = block_mask.partial_block_mask_indices.contiguous().to(torch.int32)
+        partial_block_masks = block_mask.partial_block_masks.contiguous().to(torch.bool)
+    
     # Call CUDA kernel
     omni_attn_mma_stages_split_q_shared_kv(
         query_padded, key_padded, value_padded, output_padded,
@@ -636,6 +645,10 @@ def omni_attention_mma(
         block_mask_types,
         stages,
         block_mask.BLOCK_SIZE,
+        q_orig_len,
+        partial_block_mask_indices if has_partial else torch.empty(0, dtype=torch.int32, device=query_padded.device),
+        partial_block_masks if has_partial else torch.empty(0, dtype=torch.bool, device=query_padded.device),
+        has_partial,
     )
     
     # Synchronize to catch any CUDA errors immediately
@@ -765,27 +778,27 @@ def omni_attention_simple(
     block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
     has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
     
-    partial_offsets = block_mask.partial_block_mask_indices
-    partial_masks = block_mask.partial_block_masks
+    B, H, num_q_blocks, max_blocks = block_mask_types.shape
+    partial_offsets = torch.full(
+        (B, H, num_q_blocks, max_blocks),
+        -1,
+        dtype=torch.int32,
+        device=query_padded.device
+    )
+    partial_masks = torch.empty(
+        0,
+        block_mask.BLOCK_SIZE,
+        block_mask.BLOCK_SIZE,
+        dtype=torch.bool,
+        device=query_padded.device,
+    )
+
     if has_partial:
         print("has_partial")
+        partial_offsets = block_mask.partial_block_mask_indices
+        partial_masks = block_mask.partial_block_masks
         partial_offsets = partial_offsets.contiguous().to(torch.int32)
         partial_masks = partial_masks.contiguous().to(torch.bool)
-    else:
-        B, H, num_q_blocks, max_blocks = block_mask_types.shape
-        partial_offsets = torch.full(
-            (B, H, num_q_blocks, max_blocks),
-            -1,
-            dtype=torch.int32,
-            device=query_padded.device
-        )
-        partial_masks = torch.empty(
-            0,
-            block_mask.BLOCK_SIZE,
-            block_mask.BLOCK_SIZE,
-            dtype=torch.bool,
-            device=query_padded.device,
-        )
     
     # Call CUDA kernel (pass original length to bound KV access)
     omni_attn_simple_kernel(
@@ -913,15 +926,41 @@ def omni_attention_cp_async(
     kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
     kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
     block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
+
+    # Get partial mask information
+    has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
     
-    # Call CUDA kernel (pass original length to bound KV access)
+    B, H, num_q_blocks, max_blocks = block_mask_types.shape
+    partial_offsets = torch.full(
+        (B, H, num_q_blocks, max_blocks),
+        -1,
+        dtype=torch.int32,
+        device=query_padded.device
+    )
+    partial_masks = torch.empty(
+        0,
+        block_mask.BLOCK_SIZE,
+        block_mask.BLOCK_SIZE,
+        dtype=torch.bool,
+        device=query_padded.device,
+    )
+    if has_partial:
+        partial_offsets = block_mask.partial_block_mask_indices
+        partial_masks = block_mask.partial_block_masks
+
+        partial_offsets = partial_offsets.contiguous().to(torch.int32)
+        partial_masks = partial_masks.contiguous().to(torch.bool)
+    
     omni_attn_cp_async(
         query_padded, key_padded, value_padded, output_padded,
         kv_num_blocks,
         kv_indices,
         block_mask_types,
         block_mask.BLOCK_SIZE,
-        q_orig_len,  # Original sequence length (before padding)
+        q_orig_len,
+        partial_offsets,
+        partial_masks,
+        has_partial,
     )
     
     # Synchronize to catch any CUDA errors immediately
@@ -932,6 +971,142 @@ def omni_attention_cp_async(
     
     return output
 
+def omni_attention_preftech(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    block_mask: OmniBlockMask,
+) -> Tensor:
+    """Omni-Attention with preftech CUDA kernel.
+    
+    This is a wrapper for the preftech optimized CUDA kernel that uses
+    """
+    try:
+        from omni_attn import omni_attn_preftech
+    except ImportError:
+        # Try loading from current directory if not installed
+        import sys
+        import os
+        import importlib.util
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        so_files = [
+            os.path.join(current_dir, 'omni_attn.cpython-312-x86_64-linux-gnu.so'),
+            os.path.join(current_dir, 'omni_attn.so'),
+        ]
+        
+        module = None
+        for so_path in so_files:
+            if os.path.exists(so_path):
+                try:
+                    spec = importlib.util.spec_from_file_location('omni_attn', so_path)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        omni_attn_preftech = getattr(module, 'omni_attn_preftech_kernel')
+                        break
+                except Exception as e:
+                    continue
+        
+        if module is None:
+            raise ImportError(
+                "CUDA preftech kernel not found. Please build the extension first:\n"
+                "cd omni-attn-mma && python setup.py build_ext --inplace\n"
+                f"Or ensure the .so file is in: {current_dir}"
+            )
+    
+    B, H, Q, D = query.shape
+    _, _, KV, _ = key.shape
+    
+    # Validate shapes
+    assert key.shape == (B, H, KV, D), f"Key shape mismatch: {key.shape} vs expected {(B, H, KV, D)}"
+    assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
+    assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
+    
+    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # The mask is already created with padded length, so we just need to pad Q, K, V
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    
+    Q_padded = query_padded.shape[2]
+    KV_padded = key_padded.shape[2]
+    
+    # Validate that padded lengths match mask (mask should already be padded)
+    assert Q_padded == block_mask.q_len, \
+        f"Padded Q length ({Q_padded}) doesn't match mask q_len ({block_mask.q_len})"
+    assert KV_padded == block_mask.kv_len, \
+        f"Padded KV length ({KV_padded}) doesn't match mask kv_len ({block_mask.kv_len})"
+    
+    # Validate head_dim is supported (32, 64, 128)
+    if D not in [32, 64, 128]:
+        raise ValueError(
+            f"Unsupported head_dim={D}. Supported values: 32, 64, 128. "
+            f"Please use D that results in head_dim in [32, 64, 128] (e.g., D=256 with H=8 gives head_dim=32)."
+        )
+    
+    # Validate BLOCK_SIZE is supported (64 or 128)
+    if block_mask.BLOCK_SIZE not in [64, 128]:
+        raise ValueError(
+            f"Unsupported BLOCK_SIZE={block_mask.BLOCK_SIZE}. Supported values: 64, 128."
+        )
+    
+    # Ensure contiguous and correct dtype for Q, K, V
+    query_padded = query_padded.contiguous().half()
+    key_padded = key_padded.contiguous().half()
+    value_padded = value_padded.contiguous().half()
+    
+    # Create output tensor (padded size)
+    output_padded = torch.empty_like(query_padded)
+    
+    # Ensure block mask tensors are int32 and contiguous
+    kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
+    kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
+    block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
+
+    # Get partial mask information
+    has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
+    
+    B, H, num_q_blocks, max_blocks = block_mask_types.shape
+    partial_offsets = torch.full(
+        (B, H, num_q_blocks, max_blocks),
+        -1,
+        dtype=torch.int32,
+        device=query_padded.device
+    )
+    partial_masks = torch.empty(
+        0,
+        block_mask.BLOCK_SIZE,
+        block_mask.BLOCK_SIZE,
+        dtype=torch.bool,
+        device=query_padded.device,
+    )
+    if has_partial:
+        partial_offsets = block_mask.partial_block_mask_indices
+        partial_masks = block_mask.partial_block_masks
+
+        partial_offsets = partial_offsets.contiguous().to(torch.int32)
+        partial_masks = partial_masks.contiguous().to(torch.bool)
+    
+    omni_attn_preftech(
+        query_padded, key_padded, value_padded, output_padded,
+        kv_num_blocks,
+        kv_indices,
+        block_mask_types,
+        block_mask.BLOCK_SIZE,
+        q_orig_len,
+        partial_offsets,
+        partial_masks,
+        has_partial,
+    )
+    
+    # Synchronize to catch any CUDA errors immediately
+    torch.cuda.synchronize()
+    
+    # Slice back to original length
+    output = output_padded[:, :, :q_orig_len, :]
+    
+    return output
 
 # ============================================================================
 # Utility Functions

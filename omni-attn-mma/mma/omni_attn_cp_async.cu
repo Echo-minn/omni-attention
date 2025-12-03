@@ -18,6 +18,7 @@
 #define BLOCK_MASK_MASKED 0
 #define BLOCK_MASK_CAUSAL 1
 #define BLOCK_MASK_FULL 2
+#define BLOCK_MASK_PARTIAL 3
 
 // Simple kernel using cp.async and Q tiling
 // Each thread block processes one Q block (Q_BLOCK_SIZE rows)
@@ -30,12 +31,15 @@ __global__ void omni_attn_cp_async_kernel(
     const int *__restrict__ kv_num_blocks,
     const int *__restrict__ kv_indices,
     const int *__restrict__ block_mask_types,
+    const int *__restrict__ partial_block_mask_indices,
+    const bool *__restrict__ partial_block_masks,
     int seqlen,
-    int seqlen_orig,  // Original sequence length (before padding)
+    int seqlen_orig,
     int heads,
     int batch,
     int num_q_blocks,
-    int max_kv_blocks) {
+    int max_kv_blocks,
+    bool has_partial_masks) {
   
   // Each block processes one Q block
   // grid(div_ceil(seqlen, Q_BLOCK_SIZE), batch * heads)
@@ -106,11 +110,8 @@ __global__ void omni_attn_cp_async_kernel(
   
   // Each thread processes one Q row (for correctness and simplicity)
   int q = tid;
-  if (q >= q_block_size) {
-    return; // This thread doesn't have a Q row to process
-  }
-  
-  int q_pos = q_block_start + q;
+  bool valid_q = (q < q_block_size);
+  int q_pos = valid_q ? (q_block_start + q) : 0;
   
   // Online softmax state (per thread, in registers)
   float row_max = -INFINITY;
@@ -122,18 +123,33 @@ __global__ void omni_attn_cp_async_kernel(
   
   const float scale = 1.0f / sqrtf((float)HEAD_DIM);
   
+  if (!valid_q) {
+    return;
+  }
+  
   // Process each active KV block
-  for (int kv_idx = 0; kv_idx < kv_nb; kv_idx++) {
-    // Simple indexing: base offset + kv_idx
-    int kv_block = kv_indices[mask_base + kv_idx];
-    int mask_type = block_mask_types[mask_base + kv_idx];
+  for (int kv_idx = 0; kv_idx < kv_nb && kv_idx < max_kv_blocks; kv_idx++) {
+    int idx = mask_base + kv_idx;
+    int kv_block = kv_indices[idx];
+    int mask_type = block_mask_types[idx];
     
     if (mask_type == BLOCK_MASK_MASKED) {
       continue;
     }
     
+    int partial_block_index = -1;
+    if (mask_type == BLOCK_MASK_PARTIAL) {
+      if (!has_partial_masks || partial_block_mask_indices == nullptr) {
+        continue;
+      }
+      partial_block_index = partial_block_mask_indices[idx];
+      if (partial_block_index < 0) {
+        continue;
+      }
+    }
+    
     int kv_block_start = kv_block * KV_BLOCK_SIZE;
-    int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, seqlen_orig);  // Bound by original length
+    int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, seqlen_orig);
     int kv_block_size = kv_block_end - kv_block_start;
     
     // Load K block into shared memory using cp.async
@@ -159,17 +175,27 @@ __global__ void omni_attn_cp_async_kernel(
       __syncthreads();
     }
     
-    // Find max for this KV block for this Q row
     float block_max = -INFINITY;
     for (int kv = 0; kv < kv_block_size; kv++) {
       int kv_pos = kv_block_start + kv;
       
-      // Apply causal mask if needed
       if (mask_type == BLOCK_MASK_CAUSAL && q_pos < kv_pos) {
         continue;
       }
       
-      // Compute dot product
+      if (mask_type == BLOCK_MASK_PARTIAL) {
+        int local_q = q_pos - q_block_start;
+        int local_kv = kv;
+        if (local_q < 0 || local_q >= Q_BLOCK_SIZE || local_kv < 0 || local_kv >= KV_BLOCK_SIZE) {
+          continue;
+        }
+        const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
+        int mask_offset = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
+        if (partial_block_masks == nullptr || !partial_block_masks[mask_offset]) {
+          continue;
+        }
+      }
+      
       float score = 0.0f;
       for (int d = 0; d < HEAD_DIM; d++) {
         float q_val = __half2float(Q_tile[q * HEAD_DIM + d]);
@@ -177,7 +203,6 @@ __global__ void omni_attn_cp_async_kernel(
         score += q_val * k_val;
       }
       score *= scale;
-      
       block_max = max(block_max, score);
     }
     
@@ -218,17 +243,27 @@ __global__ void omni_attn_cp_async_kernel(
       __syncthreads();
     }
     
-    // Compute exp and accumulate output for this KV block
     float new_sum = 0.0f;
     for (int kv = 0; kv < kv_block_size; kv++) {
       int kv_pos = kv_block_start + kv;
       
-      // Apply causal mask if needed
       if (mask_type == BLOCK_MASK_CAUSAL && q_pos < kv_pos) {
         continue;
       }
       
-      // Compute score
+      if (mask_type == BLOCK_MASK_PARTIAL) {
+        int local_q = q_pos - q_block_start;
+        int local_kv = kv;
+        if (local_q < 0 || local_q >= Q_BLOCK_SIZE || local_kv < 0 || local_kv >= KV_BLOCK_SIZE) {
+          continue;
+        }
+        const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
+        int mask_offset = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
+        if (partial_block_masks == nullptr || !partial_block_masks[mask_offset]) {
+          continue;
+        }
+      }
+      
       float score = 0.0f;
       for (int d = 0; d < HEAD_DIM; d++) {
         float q_val = __half2float(Q_tile[q * HEAD_DIM + d]);
@@ -237,11 +272,9 @@ __global__ void omni_attn_cp_async_kernel(
       }
       score *= scale;
       
-      // Compute exp(score - row_max)
       float exp_score = expf(score - row_max);
       new_sum += exp_score;
       
-      // Accumulate weighted V
       for (int d = 0; d < HEAD_DIM; d++) {
         float v_val = __half2float(V_tile[kv * HEAD_DIM + d]);
         row_out[d] += exp_score * v_val;
@@ -267,7 +300,9 @@ __global__ void omni_attn_cp_async_kernel(
 void omni_attn_cp_async(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int BLOCK_SIZE, int seqlen_orig) {
+    torch::Tensor block_mask_types, int BLOCK_SIZE, int seqlen_orig,
+    torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
+    bool has_partial) {
   
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
@@ -303,6 +338,22 @@ void omni_attn_cp_async(
     throw std::runtime_error(
         "Block mask tensors must be contiguous. Call .contiguous() before calling this function.");
   }
+  
+  const bool has_partial_masks = has_partial;
+  if (has_partial_masks) {
+    if (!partial_block_mask_indices.is_contiguous() || !partial_block_masks.is_contiguous()) {
+      throw std::runtime_error("Partial block mask tensors must be contiguous.");
+    }
+    CHECK_TORCH_TENSOR_DTYPE(partial_block_mask_indices, torch::kInt32)
+    CHECK_TORCH_TENSOR_DTYPE(partial_block_masks, torch::kBool)
+  }
+  
+  const int *partial_idx_ptr = has_partial_masks
+                                   ? reinterpret_cast<int *>(partial_block_mask_indices.data_ptr())
+                                   : nullptr;
+  const bool *partial_masks_ptr = has_partial_masks
+                                      ? reinterpret_cast<bool *>(partial_block_masks.data_ptr())
+                                      : nullptr;
   
   // Validate head_dim
   if (head_dim != 32 && head_dim != 64 && head_dim != 128) {
@@ -340,7 +391,8 @@ void omni_attn_cp_async(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks);
+          partial_idx_ptr, partial_masks_ptr,
+          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks, has_partial_masks);
     } else if (head_dim == 64) {
       omni_attn_cp_async_kernel<64, 64, 64><<<grid, block, smem_size>>>(
           reinterpret_cast<half *>(Q.data_ptr()),
@@ -350,7 +402,8 @@ void omni_attn_cp_async(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks);
+          partial_idx_ptr, partial_masks_ptr,
+          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks, has_partial_masks);
     } else if (head_dim == 128) {
       omni_attn_cp_async_kernel<64, 64, 128><<<grid, block, smem_size>>>(
           reinterpret_cast<half *>(Q.data_ptr()),
@@ -360,7 +413,8 @@ void omni_attn_cp_async(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks);
+          partial_idx_ptr, partial_masks_ptr,
+          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks, has_partial_masks);
     }
   } else if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 128) {
     if (head_dim == 32) {
@@ -372,7 +426,8 @@ void omni_attn_cp_async(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks);
+          partial_idx_ptr, partial_masks_ptr,
+          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks, has_partial_masks);
     } else if (head_dim == 64) {
       omni_attn_cp_async_kernel<128, 128, 64><<<grid, block, smem_size>>>(
           reinterpret_cast<half *>(Q.data_ptr()),
@@ -382,7 +437,8 @@ void omni_attn_cp_async(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks);
+          partial_idx_ptr, partial_masks_ptr,
+          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks, has_partial_masks);
     } else if (head_dim == 128) {
       omni_attn_cp_async_kernel<128, 128, 128><<<grid, block, smem_size>>>(
           reinterpret_cast<half *>(Q.data_ptr()),
@@ -392,7 +448,8 @@ void omni_attn_cp_async(
           reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
           reinterpret_cast<int *>(kv_indices.data_ptr()),
           reinterpret_cast<int *>(block_mask_types.data_ptr()),
-          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks);
+          partial_idx_ptr, partial_masks_ptr,
+          seqlen, seqlen_orig, heads, batch, num_q_blocks, max_kv_blocks, has_partial_masks);
     }
   } else {
     throw std::runtime_error(

@@ -11,6 +11,9 @@ import os
 import time
 from omni_attn_torch import (
     omni_attention_simple,
+    omni_attention_cp_async,
+    omni_attention_mma,
+    omni_attention_preftech,
     check_correctness,
 )
 
@@ -78,6 +81,13 @@ def test_flex_attention(Q, K, V, dense_mask, reference_output, device="cuda"):
 
 def test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output):
     """Test omni_attention_simple with fixed debug data."""
+
+    print("\n" + "="*60)
+    print("Testing omni_attention_simple...")
+    print("="*60)
+    
+    omni_output = None
+    omni_time = None
     try:
         _ = omni_attention_simple(Q, K, V, omni_block_mask)
         torch.cuda.synchronize()
@@ -93,6 +103,107 @@ def test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output):
             rtol=1e-1,
             atol=1e-2,
             name="omni_attention_simple"
+        )
+        print(f"  Time: {omni_time*1000:.2f}ms")
+        
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+      
+    return omni_output, omni_time
+
+def test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output):
+    """Test omni_attention_cp_async with fixed debug data."""
+    print("\n" + "="*60)
+    print("Testing omni_attention_cp_async...")
+    print("="*60)
+    
+    omni_output = None
+    omni_time = None
+    try:
+        _ = omni_attention_cp_async(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        omni_output = omni_attention_cp_async(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        omni_time = time.time() - start
+        
+        check_correctness(
+            reference_output,
+            omni_output,
+            rtol=1e-1,
+            atol=1e-2,
+            name="omni_attention_cp_async"
+        )
+        print(f"  Time: {omni_time*1000:.2f}ms")
+        
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+      
+    return omni_output, omni_time
+
+def test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output):
+    """Test omni_attn_shared_kv with fixed debug data."""
+    print("\n" + "="*60)
+    print("Testing omni_attn_shared_kv...")
+    print("="*60)
+    
+    omni_output = None
+    omni_time = None
+    try:
+        _ = omni_attention_mma(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        omni_output = omni_attention_mma(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        omni_time = time.time() - start
+
+        passed =check_correctness(
+            reference_output,
+            omni_output,
+            rtol=1e-1,
+            atol=1e-2,
+            name="omni_attn_shared_kv"
+        )
+        print(f"  Time: {omni_time*1000:.2f}ms")
+        
+       
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+      
+    return omni_output, omni_time
+
+
+def test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output):
+    """Test omni_attention_preftech with fixed debug data."""
+    print("\n" + "="*60)
+    print("Testing omni_attention_preftech...")
+    print("="*60)
+    
+    omni_output = None
+    omni_time = None
+    try:
+        _ = omni_attention_preftech(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        omni_output = omni_attention_preftech(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        omni_time = time.time() - start
+        
+        check_correctness(
+            reference_output,
+            omni_output,
+            rtol=1e-1,
+            atol=1e-2,
+            name="omni_attention_preftech"
         )
         print(f"  Time: {omni_time*1000:.2f}ms")
         
@@ -122,17 +233,11 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     print(f"  Q shape: {Q.shape}, dtype: {Q.dtype}")
     print(f"  Reference output shape: {reference_output.shape}")
     
-    # Test omni_attention_simple
-    print("\n" + "="*60)
-    print("Testing omni_attention_simple...")
-    print("="*60)
-    
-    omni_output = None
-    omni_time = None
-    
-    omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
-
     flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, device)
+    # omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
+    # omni_output, omni_time = test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output)
+    # omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
+    omni_output, omni_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)
 
     # Compare omni vs flex
     if omni_output is not None:
@@ -150,7 +255,7 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
         
         if omni_time and flex_time:
             speedup = omni_time / flex_time
-            faster = "omni" if speedup > 1 else "flex"
+            faster = "omni" if speedup < 1 else "flex"
             print(f"  Speedup: {speedup:.2f}x ({faster} faster)")
             print(f"    omni: {omni_time*1000:.2f}ms")
             print(f"    flex: {flex_time*1000:.2f}ms")

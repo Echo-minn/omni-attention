@@ -162,7 +162,7 @@ def generate_fixed_debug_causal_data(
     
     return debug_data
 
-def generate_fixed_debug_omni_data(
+def generate_fixed_debug_F_C_data(
     B=1,
     H=8,
     seq_len=512,
@@ -189,7 +189,7 @@ def generate_fixed_debug_omni_data(
     K = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     V = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     
-    # Create OmniBlockMask with random pattern
+    # Create OmniBlockMask with random FULL/CAUSAL pattern
     q_len_padded = ((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
     kv_len_padded = q_len_padded
     num_q_blocks = q_len_padded // BLOCK_SIZE
@@ -200,7 +200,8 @@ def generate_fixed_debug_omni_data(
     kv_indices = torch.zeros(B, H, num_q_blocks, max_blocks, dtype=torch.int32, device=device)
     block_mask_types = torch.zeros(B, H, num_q_blocks, max_blocks, dtype=torch.int32, device=device)
     
-    # Generate random pattern: for each q_block, randomly assign FULL/CAUSAL to each kv_block
+    # Generate random pattern: for each q_block, attend to all previous kv_blocks (0 to q_block)
+    # Each block is randomly assigned as FULL or CAUSAL
     for q_block in range(num_q_blocks):
         num_active = 0
         for kv_block in range(q_block + 1):
@@ -222,7 +223,29 @@ def generate_fixed_debug_omni_data(
     )
     
     # Create dense mask from block pattern
-    dense_mask = omni_block_mask.to_dense_mask()
+    dense_mask = torch.zeros(B, H, seq_len, seq_len, device=device, dtype=torch.bool)
+    
+    for q_block in range(num_q_blocks):
+        q_start = q_block * BLOCK_SIZE
+        q_end = min(q_start + BLOCK_SIZE, seq_len)
+        num_active = kv_num_blocks[0, 0, q_block].item()
+        
+        for i in range(num_active):
+            kv_block = kv_indices[0, 0, q_block, i].item()
+            mask_type = block_mask_types[0, 0, q_block, i].item()
+            kv_start = kv_block * BLOCK_SIZE
+            kv_end = min(kv_start + BLOCK_SIZE, seq_len)
+            
+            if mask_type == BlockMaskType.FULL:
+                # Full attention: all q can attend to all kv in this block
+                dense_mask[:, :, q_start:q_end, kv_start:kv_end] = True
+            elif mask_type == BlockMaskType.CAUSAL:
+                # Causal: q_idx >= kv_idx within block
+                for q_idx in range(q_start, q_end):
+                    kv_start_causal = kv_start
+                    kv_end_causal = min(q_idx + 1, kv_end)
+                    dense_mask[:, :, q_idx, kv_start_causal:kv_end_causal] = True
+    
     score_mask = torch.where(dense_mask, 0.0, float('-inf')).to(torch.float32)
     
     print("\nComputing reference output...")
@@ -255,7 +278,7 @@ def generate_fixed_debug_omni_data(
     print(f"\nSaving to {output_file}...")
     torch.save(debug_data, output_file, _use_new_zipfile_serialization=False)
     
-    print(f"\n✓ Saved. Random block mask pattern (head=0):")
+    print(f"\n✓ Saved. Random block mask pattern (head=0, F=FULL, C=CAUSAL):")
     print_block_pattern(block_mask_types, kv_num_blocks)
     
     return debug_data
@@ -270,18 +293,16 @@ def generate_fixed_debug_partial_data(
     output_file="debug_data_partial.pt",
     seed=42
 ):
-    """Generate fixed debug data with PARTIAL block pattern."""
-    """Generate fixed debug data with random FULL/CAUSAL block pattern.
-    
-    Each q_block attends to all previous kv_blocks (0 to q_block),
-    with each block randomly assigned as FULL or CAUSAL.
+    """
+    Generate fixed debug data with PARTIAL block pattern.
+    with each block randomly assigned as FULL, CAUSAL, or PARTIAL.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
-    print(f"Generating random FULL/CAUSAL debug data:")
+    print(f"Generating random FULL/CAUSAL/PARTIAL debug data:")
     print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, BLOCK_SIZE={BLOCK_SIZE}")
     
     Q = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
@@ -423,29 +444,29 @@ if __name__ == "__main__":
     #     head_dim=args.head_dim,
     #     BLOCK_SIZE=args.BLOCK_SIZE,
     #     device=args.device,
-    #     output_file='debug_data.pt',
+    #     output_file='data/1024/debug_data.pt',
     #     seed=args.seed,
     # )
 
-    # generate_fixed_debug_omni_data(
-    #     B=args.B,
-    #     H=args.H,
-    #     seq_len=args.seq_len,
-    #     head_dim=args.head_dim,
-    #     BLOCK_SIZE=args.BLOCK_SIZE,
-    #     device=args.device,
-    #     output_file='debug_data_omni.pt',
-    #     seed=args.seed,
-    # )
-
-    generate_fixed_debug_partial_data(
+    generate_fixed_debug_F_C_data(
         B=args.B,
         H=args.H,
         seq_len=args.seq_len,
         head_dim=args.head_dim,
         BLOCK_SIZE=args.BLOCK_SIZE,
         device=args.device,
-        output_file='data/1024/debug_data_partial.pt',
+        output_file='data/1024/debug_data_F_C.pt',
         seed=args.seed,
     )
+
+    # generate_fixed_debug_partial_data(
+    #     B=args.B,
+    #     H=args.H,
+    #     seq_len=args.seq_len,
+    #     head_dim=args.head_dim,
+    #     BLOCK_SIZE=args.BLOCK_SIZE,
+    #     device=args.device,
+    #     output_file='data/1024/debug_data_partial.pt',
+    #     seed=args.seed,
+    # )
 
