@@ -23,56 +23,8 @@ except ImportError:
     HAS_FLEX_ATTN = False
     print("Warning: flex_attention not available")
 
-def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
-    """Test kernels with fixed debug data."""
-    print(f"Loading debug data from {debug_data_file}...")
-    # Use weights_only=False for custom objects (OmniBlockMask)
-    data = torch.load(debug_data_file, map_location=device, weights_only=False)
-    
-    Q = data['Q'].to(device)
-    K = data['K'].to(device)
-    V = data['V'].to(device)
-    reference_output = data['reference_output'].to(device)
-    omni_block_mask = data['omni_block_mask']
-    dense_mask = data.get('dense_mask', None)
-    metadata = data['metadata']
-    
-    print(f"\nTesting with fixed data:")
-    print(f"  {metadata}")
-    print(f"  Q shape: {Q.shape}, dtype: {Q.dtype}")
-    print(f"  Reference output shape: {reference_output.shape}")
-    
-    # Test omni_attention_simple
-    print("\n" + "="*60)
-    print("Testing omni_attention_simple...")
-    print("="*60)
-    
-    omni_output = None
-    omni_time = None
-    try:
-        _ = omni_attention_simple(Q, K, V, omni_block_mask)
-        torch.cuda.synchronize()
-        
-        start = time.time()
-        omni_output = omni_attention_simple(Q, K, V, omni_block_mask)
-        torch.cuda.synchronize()
-        omni_time = time.time() - start
-        
-        check_correctness(
-            reference_output,
-            omni_output,
-            rtol=1e-1,
-            atol=1e-2,
-            name="omni_attention_simple"
-        )
-        print(f"  Time: {omni_time*1000:.2f}ms")
-        
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Test flex_attention if available and dense_mask exists
+def test_flex_attention(Q, K, V, dense_mask, reference_output, device="cuda"):
+    """Test flex_attention with fixed debug data."""
     if HAS_FLEX_ATTN and dense_mask is not None:
         print("\n" + "="*60)
         print("Testing flex_attention...")
@@ -112,27 +64,6 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
                 name="flex_attention"
             )
             print(f"  Time: {flex_time*1000:.2f}ms")
-            
-            # Compare omni vs flex
-            if omni_output is not None:
-                print("\n" + "="*60)
-                print("Comparing omni_attention_simple vs flex_attention...")
-                print("="*60)
-                
-                check_correctness(
-                    omni_output,
-                    flex_output,
-                    rtol=1e-1,
-                    atol=1e-2,
-                    name="omni vs flex"
-                )
-                
-                if omni_time and flex_time:
-                    speedup = omni_time / flex_time
-                    faster = "omni" if speedup > 1 else "flex"
-                    print(f"  Speedup: {speedup:.2f}x ({faster} faster)")
-                    print(f"    omni: {omni_time*1000:.2f}ms")
-                    print(f"    flex: {flex_time*1000:.2f}ms")
         
         except Exception as e:
             print(f"✗ Error: {e}")
@@ -143,6 +74,87 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     elif dense_mask is None:
         print("\nSkipping flex_attention (dense_mask not in debug data)")
 
+    return flex_output, flex_time
+
+def test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output):
+    """Test omni_attention_simple with fixed debug data."""
+    try:
+        _ = omni_attention_simple(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        omni_output = omni_attention_simple(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        omni_time = time.time() - start
+        
+        check_correctness(
+            reference_output,
+            omni_output,
+            rtol=1e-1,
+            atol=1e-2,
+            name="omni_attention_simple"
+        )
+        print(f"  Time: {omni_time*1000:.2f}ms")
+        
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+      
+    return omni_output, omni_time
+
+def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
+    """Test kernels with fixed debug data."""
+    print(f"Loading debug data from {debug_data_file}...")
+    # Use weights_only=False for custom objects (OmniBlockMask)
+    data = torch.load(debug_data_file, map_location=device, weights_only=False)
+    
+    Q = data['Q'].to(device)
+    K = data['K'].to(device)
+    V = data['V'].to(device)
+    reference_output = data['reference_output'].to(device)
+    omni_block_mask = data['omni_block_mask']
+    dense_mask = data.get('dense_mask', None)
+    metadata = data['metadata']
+    
+    print(f"\nTesting with fixed data:")
+    print(f"  {metadata}")
+    print(f"  Q shape: {Q.shape}, dtype: {Q.dtype}")
+    print(f"  Reference output shape: {reference_output.shape}")
+    
+    # Test omni_attention_simple
+    print("\n" + "="*60)
+    print("Testing omni_attention_simple...")
+    print("="*60)
+    
+    omni_output = None
+    omni_time = None
+    
+    omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
+
+    flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, device)
+
+    # Compare omni vs flex
+    if omni_output is not None:
+        print("\n" + "="*60)
+        print("Comparing omni_attention_simple vs flex_attention...")
+        print("="*60)
+        
+        check_correctness(
+            omni_output,
+            flex_output,
+            rtol=1e-1,
+            atol=1e-2,
+            name="omni vs flex"
+        )
+        
+        if omni_time and flex_time:
+            speedup = omni_time / flex_time
+            faster = "omni" if speedup > 1 else "flex"
+            print(f"  Speedup: {speedup:.2f}x ({faster} faster)")
+            print(f"    omni: {omni_time*1000:.2f}ms")
+            print(f"    flex: {flex_time*1000:.2f}ms")
+        
 
 if __name__ == "__main__":
     import argparse

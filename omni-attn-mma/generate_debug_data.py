@@ -15,12 +15,24 @@ import os
 from omni_attn_torch import (
     create_causal_omni_block_mask,
     naive_attention_with_dense_mask,
-    naive_attention,
-    omni_attention_simple,
     OmniBlockMask,
     BlockMaskType,
     build_partial_block_data,
 )
+
+def print_block_pattern(block_mask_types, kv_num_blocks, number_of_blocks_to_print=4):
+    for q_block in range(number_of_blocks_to_print):
+        num_active = kv_num_blocks[0, 0, q_block].item()
+        pattern = []
+        for i in range(num_active):
+            mask_type = block_mask_types[0, 0, q_block, i].item()
+            if mask_type == BlockMaskType.FULL:
+                pattern.append('F')
+            elif mask_type == BlockMaskType.CAUSAL:
+                pattern.append('C')
+            else:  # PARTIAL
+                pattern.append('P')
+        print(f"  q_block={q_block}: {' '.join(pattern)}")
 
 def generate_fixed_debug_causal_data(
     B=1,
@@ -244,13 +256,7 @@ def generate_fixed_debug_omni_data(
     torch.save(debug_data, output_file, _use_new_zipfile_serialization=False)
     
     print(f"\n✓ Saved. Random block mask pattern (head=0):")
-    for q_block in range(min(4, num_q_blocks)):
-        num_active = kv_num_blocks[0, 0, q_block].item()
-        pattern = []
-        for i in range(num_active):
-            mask_type = block_mask_types[0, 0, q_block, i].item()
-            pattern.append(f"{'F' if mask_type == BlockMaskType.FULL else 'C'}")
-        print(f"  q_block={q_block}: {' '.join(pattern)}")
+    print_block_pattern(block_mask_types, kv_num_blocks)
     
     return debug_data
 
@@ -354,7 +360,7 @@ def generate_fixed_debug_partial_data(
                     dense_mask[:, :, q_idx, kv_start_causal:kv_end_causal] = True
     
     score_mask = torch.where(dense_mask, 0.0, float('-inf')).to(torch.float32)
-    
+
     print("Building partial block data...")
     partial_indices, partial_masks = build_partial_block_data(omni_block_mask, dense_mask)
     omni_block_mask.partial_block_mask_indices = partial_indices
@@ -391,18 +397,7 @@ def generate_fixed_debug_partial_data(
     torch.save(debug_data, output_file, _use_new_zipfile_serialization=False)
     
     print(f"\n✓ Saved. Random block mask pattern (head=0, F=FULL, C=CAUSAL, P=PARTIAL):")
-    for q_block in range(min(4, num_q_blocks)):
-        num_active = kv_num_blocks[0, 0, q_block].item()
-        pattern = []
-        for i in range(num_active):
-            mask_type = block_mask_types[0, 0, q_block, i].item()
-            if mask_type == BlockMaskType.FULL:
-                pattern.append('F')
-            elif mask_type == BlockMaskType.CAUSAL:
-                pattern.append('C')
-            else:  # PARTIAL
-                pattern.append('P')
-        print(f"  q_block={q_block}: {' '.join(pattern)}")
+    print_block_pattern(block_mask_types, kv_num_blocks)
     
     return debug_data
 
@@ -450,7 +445,7 @@ if __name__ == "__main__":
         head_dim=args.head_dim,
         BLOCK_SIZE=args.BLOCK_SIZE,
         device=args.device,
-        output_file='debug_data_partial.pt',
+        output_file='data/1024/debug_data_partial.pt',
         seed=args.seed,
     )
 
