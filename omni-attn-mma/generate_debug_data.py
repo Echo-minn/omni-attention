@@ -19,6 +19,7 @@ from omni_attn_torch import (
     omni_attention_simple,
     OmniBlockMask,
     BlockMaskType,
+    build_partial_block_data,
 )
 
 def generate_fixed_debug_causal_data(
@@ -354,6 +355,11 @@ def generate_fixed_debug_partial_data(
     
     score_mask = torch.where(dense_mask, 0.0, float('-inf')).to(torch.float32)
     
+    print("Building partial block data...")
+    partial_indices, partial_masks = build_partial_block_data(omni_block_mask, dense_mask)
+    omni_block_mask.partial_block_mask_indices = partial_indices
+    omni_block_mask.partial_block_masks = partial_masks
+
     print("\nComputing reference output...")
     reference_output = naive_attention_with_dense_mask(Q, K, V, mask=score_mask)
     

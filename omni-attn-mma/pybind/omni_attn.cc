@@ -14,7 +14,9 @@ void omni_attn_simple_kernel(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor block_mask_types,
                                              int BLOCK_SIZE,
                                              int seqlen_orig,
-                                             torch::Tensor dense_mask = torch::Tensor());
+                                             torch::Tensor partial_block_mask_indices,
+                                             torch::Tensor partial_block_masks,
+                                             bool has_partial);
 
 void omni_attn_cp_async(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor V, torch::Tensor O,

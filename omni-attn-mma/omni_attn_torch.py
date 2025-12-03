@@ -63,6 +63,8 @@ class OmniBlockMask:
     q_len: int
     kv_len: int
     BLOCK_SIZE: int = 128
+    partial_block_mask_indices: Optional[Tensor] = None  # [B, H, num_q_blocks, max_blocks] or None
+    partial_block_masks: Optional[Tensor] = None  # [num_partial_blocks, BLOCK_SIZE, BLOCK_SIZE] or None
     
     @property
     def num_q_blocks(self) -> int:
@@ -121,32 +123,101 @@ class OmniBlockMask:
                                 for ki in range(kv_start, min(qi + 1, kv_end)):
                                     dense_mask[b, h, qi, ki] = True
                         elif mask_type == BlockMaskType.PARTIAL:
-                            # PARTIAL: Block contains mixed content or crosses boundaries
-                            # Use CAUSAL as conservative fallback (requires per-token check in actual kernel)
-                            # In practice, PARTIAL blocks need the original modality info for accurate masking
+                            # Use stored per-block masks when available
+                            if (
+                                self.partial_block_mask_indices is not None
+                                and self.partial_block_masks is not None
+                            ):
+                                partial_idx = self.partial_block_mask_indices[b, h, q_block, idx].item()
+                                if partial_idx >= 0 and partial_idx < self.partial_block_masks.shape[0]:
+                                    block = self.partial_block_masks[partial_idx]
+                                    qq = q_end - q_start
+                                    kk = kv_end - kv_start
+                                    dense_mask[b, h, q_start:q_end, kv_start:kv_end] = block[:qq, :kk]
+                                    continue
+                            # Fallback: treat as causal within block
                             for qi in range(q_start, q_end):
                                 for ki in range(kv_start, min(qi + 1, kv_end)):
                                     dense_mask[b, h, qi, ki] = True
         
         return dense_mask
+
+
+def build_partial_block_data(
+    block_mask: OmniBlockMask,
+    dense_mask: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Build per-block bitmasks for PARTIAL blocks from a dense mask."""
+    B, H, num_q_blocks, max_blocks = block_mask.block_mask_types.shape
+    device = dense_mask.device
+    BLOCK_SIZE = block_mask.BLOCK_SIZE
     
-    def to_score_mask(self) -> Tensor:
-        """Convert to score mask with -inf for masked positions.
-        
-        Returns:
-            mask: Float tensor with 0 for attend, -inf for masked
-        """
-        bool_mask = self.to_dense_mask()
-        score_mask = torch.where(bool_mask, 0.0, float('-inf'))
-        return score_mask.to(torch.float32)
+    # Ensure dense_mask matches padded lengths
+    if dense_mask.shape[2] != block_mask.q_len or dense_mask.shape[3] != block_mask.kv_len:
+        padded = torch.zeros(
+            B, H, block_mask.q_len, block_mask.kv_len, dtype=dense_mask.dtype, device=device
+        )
+        q_len = min(dense_mask.shape[2], block_mask.q_len)
+        kv_len = min(dense_mask.shape[3], block_mask.kv_len)
+        padded[:, :, :q_len, :kv_len] = dense_mask[:, :, :q_len, :kv_len]
+        dense_mask = padded
     
-    def sparsity(self) -> float:
-        """Compute the sparsity ratio (percentage of skipped computation)."""
-        total_blocks = self.num_q_blocks * self.num_kv_blocks
-        active_blocks = self.kv_num_blocks.float().sum().item()
-        B, H = self.kv_num_blocks.shape[:2]
-        avg_active = active_blocks / (B * H)
-        return 100.0 * (1.0 - avg_active / total_blocks)
+    partial_indices = torch.full(
+        (B, H, num_q_blocks, max_blocks), -1, dtype=torch.int32, device=device
+    )
+    partial_masks: List[Tensor] = []
+    
+    for b in range(B):
+        for h in range(H):
+            for q_block in range(num_q_blocks):
+                num_active = block_mask.kv_num_blocks[b, h, q_block].item()
+                q_start = q_block * BLOCK_SIZE
+                q_end = min(q_start + BLOCK_SIZE, block_mask.q_len)
+                for idx in range(num_active):
+                    mask_type = block_mask.block_mask_types[b, h, q_block, idx].item()
+                    if mask_type != BlockMaskType.PARTIAL:
+                        continue
+                    kv_block = block_mask.kv_indices[b, h, q_block, idx].item()
+                    kv_start = kv_block * BLOCK_SIZE
+                    kv_end = min(kv_start + BLOCK_SIZE, block_mask.kv_len)
+                    
+                    block = torch.zeros(
+                        BLOCK_SIZE, BLOCK_SIZE, dtype=torch.bool, device=device
+                    )
+                    q_len_block = q_end - q_start
+                    kv_len_block = kv_end - kv_start
+                    block[:q_len_block, :kv_len_block] = dense_mask[
+                        b, h, q_start:q_end, kv_start:kv_end
+                    ]
+                    partial_indices[b, h, q_block, idx] = len(partial_masks)
+                    partial_masks.append(block)
+    
+    if partial_masks:
+        partial_mask_tensor = torch.stack(partial_masks, dim=0)
+    else:
+        partial_mask_tensor = torch.empty(
+            0, BLOCK_SIZE, BLOCK_SIZE, dtype=torch.bool, device=device
+        )
+    
+    return partial_indices, partial_mask_tensor
+    
+def to_score_mask(self) -> Tensor:
+    """Convert to score mask with -inf for masked positions.
+    
+    Returns:
+        mask: Float tensor with 0 for attend, -inf for masked
+    """
+    bool_mask = self.to_dense_mask()
+    score_mask = torch.where(bool_mask, 0.0, float('-inf'))
+    return score_mask.to(torch.float32)
+
+def sparsity(self) -> float:
+    """Compute the sparsity ratio (percentage of skipped computation)."""
+    total_blocks = self.num_q_blocks * self.num_kv_blocks
+    active_blocks = self.kv_num_blocks.float().sum().item()
+    B, H = self.kv_num_blocks.shape[:2]
+    avg_active = active_blocks / (B * H)
+    return 100.0 * (1.0 - avg_active / total_blocks)
 
 
 def omni_block_mask_from_flex_block_mask(flex_block_mask) -> OmniBlockMask:
@@ -607,8 +678,6 @@ def omni_attention_simple(
     key: Tensor,
     value: Tensor,
     block_mask: OmniBlockMask,
-    scale: Optional[float] = None,
-    dense_mask: Optional[Tensor] = None,  # Optional: pre-computed dense mask for PARTIAL blocks
 ) -> Tensor:
     """Omni-Attention with simple CUDA kernel (correctness baseline).
     
@@ -694,23 +763,29 @@ def omni_attention_simple(
     kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
     kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
     block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
-    
-    # Check if we have PARTIAL blocks - if so, we need dense_mask
     has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
+    
+    partial_offsets = block_mask.partial_block_mask_indices
+    partial_masks = block_mask.partial_block_masks
     if has_partial:
-        if dense_mask is None:
-            # Fallback: use to_dense_mask() (treats PARTIAL as CAUSAL - not ideal)
-            # Ideally, caller should provide the correct dense_mask
-            dense_mask = block_mask.to_dense_mask().contiguous()
-        else:
-            # Validate provided dense_mask
-            B, H, Q, D = query_padded.shape
-            if dense_mask.shape != (B, H, Q_padded, KV_padded):
-                raise ValueError(
-                    f"dense_mask shape {dense_mask.shape} doesn't match "
-                    f"expected {(B, H, Q_padded, KV_padded)}"
-                )
-            dense_mask = dense_mask.contiguous()
+        print("has_partial")
+        partial_offsets = partial_offsets.contiguous().to(torch.int32)
+        partial_masks = partial_masks.contiguous().to(torch.bool)
+    else:
+        B, H, num_q_blocks, max_blocks = block_mask_types.shape
+        partial_offsets = torch.full(
+            (B, H, num_q_blocks, max_blocks),
+            -1,
+            dtype=torch.int32,
+            device=query_padded.device
+        )
+        partial_masks = torch.empty(
+            0,
+            block_mask.BLOCK_SIZE,
+            block_mask.BLOCK_SIZE,
+            dtype=torch.bool,
+            device=query_padded.device,
+        )
     
     # Call CUDA kernel (pass original length to bound KV access)
     omni_attn_simple_kernel(
@@ -720,7 +795,9 @@ def omni_attention_simple(
         block_mask_types,
         block_mask.BLOCK_SIZE,
         q_orig_len,  # Original sequence length (before padding)
-        dense_mask if dense_mask is not None else torch.empty(0, dtype=torch.bool, device=query_padded.device),
+        partial_offsets,
+        partial_masks,
+        has_partial,
     )
     
     # Synchronize to catch any CUDA errors immediately
@@ -1242,7 +1319,7 @@ def create_omni_block_mask_from_modality_positions(
             
             kv_num_blocks[b, :, q_block] = num_active
     
-    return OmniBlockMask(
+    omni_block_mask = OmniBlockMask(
         kv_num_blocks=kv_num_blocks,
         kv_indices=kv_indices,
         block_mask_types=block_mask_types,
@@ -1250,6 +1327,22 @@ def create_omni_block_mask_from_modality_positions(
         kv_len=kv_len_padded,  # Return padded length
         BLOCK_SIZE=BLOCK_SIZE,
     )
+    
+    if (block_mask_types == BlockMaskType.PARTIAL).any():
+        from transfusion_pytorch.transfusion import naive_attn_mask
+        
+        dense_mask_tokens = naive_attn_mask(q_len, modality_positions, device=device)  # [B, q_len, q_len]
+        dense_mask_tokens = dense_mask_tokens.unsqueeze(1).expand(-1, nheads, -1, -1)
+        dense_mask = torch.zeros(
+            batch, nheads, q_len_padded, kv_len_padded, dtype=torch.bool, device=device
+        )
+        dense_mask[:, :, :q_len, :kv_len] = dense_mask_tokens
+        
+        partial_indices, partial_masks = build_partial_block_data(omni_block_mask, dense_mask)
+        omni_block_mask.partial_block_mask_indices = partial_indices
+        omni_block_mask.partial_block_masks = partial_masks
+    
+    return omni_block_mask
 
 
 def generate_random_input_with_modalities(

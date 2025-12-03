@@ -26,7 +26,8 @@ __global__ void omni_attn_simple_kernel_impl(
     const int *__restrict__ kv_num_blocks,
     const int *__restrict__ kv_indices,
     const int *__restrict__ block_mask_types,
-    const bool *__restrict__ dense_mask,  // Optional: per-token mask for PARTIAL blocks [B, H, Q, KV]
+    const int *__restrict__ partial_block_mask_indices,
+    const bool *__restrict__ partial_block_masks,
     int QKV_seqlen,
     int QKV_seqlen_orig,  // Original sequence length (before padding)
     int QKV_head,
@@ -45,11 +46,7 @@ __global__ void omni_attn_simple_kernel_impl(
     int block_mask_types_stride1,
     int block_mask_types_stride2,
     int block_mask_types_stride3,
-    int dense_mask_stride0,  // Strides for dense_mask
-    int dense_mask_stride1,
-    int dense_mask_stride2,
-    int dense_mask_stride3,
-    bool has_dense_mask,  // Whether dense_mask is provided (non-null)
+    bool has_partial_masks,
     int head_dim) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total_q = QKV_batch * QKV_head * QKV_seqlen;
@@ -117,6 +114,21 @@ __global__ void omni_attn_simple_kernel_impl(
     int kv_start = kv_block_start;
     int kv_end = kv_block_end;
 
+    int partial_block_index = -1;
+    if (mask_type == BLOCK_MASK_PARTIAL) {
+      if (!has_partial_masks) {
+        continue;
+      }
+      partial_block_index =
+          partial_block_mask_indices[batch_id * block_mask_types_stride0 +
+                                     head_id * block_mask_types_stride1 +
+                                     q_block * block_mask_types_stride2 +
+                                     kv_idx * block_mask_types_stride3];
+      if (partial_block_index < 0) {
+        continue;
+      }
+    }
+
     // CAUSAL semantics: within this block, only attend to positions <= q_idx.
     if (mask_type == BLOCK_MASK_CAUSAL) {
       if (q_idx < kv_block_start) {
@@ -125,22 +137,20 @@ __global__ void omni_attn_simple_kernel_impl(
       }
       kv_end = min(kv_end, q_idx + 1);
     }
-    
-    // PARTIAL blocks require per-token dense mask check
-    // If dense_mask is not provided, skip PARTIAL blocks (error case)
-    if (mask_type == BLOCK_MASK_PARTIAL && !has_dense_mask) {
-      continue;  // Skip if no dense mask provided
-    }
 
     for (int kv = kv_start; kv < kv_end; ++kv) {
-      // For PARTIAL blocks, check dense mask per-token
       if (mask_type == BLOCK_MASK_PARTIAL) {
-        int dense_mask_idx = batch_id * dense_mask_stride0 +
-                            head_id * dense_mask_stride1 +
-                            q_idx * dense_mask_stride2 +
-                            kv * dense_mask_stride3;
-        if (!dense_mask[dense_mask_idx]) {
-          continue;  // Skip masked positions in PARTIAL blocks
+        int local_q = q_idx - q_block * BLOCK_SIZE;
+        int local_kv = kv - kv_block * BLOCK_SIZE;
+        if (local_q < 0 || local_q >= BLOCK_SIZE || local_kv < 0 ||
+            local_kv >= BLOCK_SIZE) {
+          continue;
+        }
+        const int block_area = BLOCK_SIZE * BLOCK_SIZE;
+        int mask_offset =
+            partial_block_index * block_area + local_q * BLOCK_SIZE + local_kv;
+        if (!partial_block_masks[mask_offset]) {
+          continue;
         }
       }
       
@@ -207,30 +217,43 @@ __global__ void omni_attn_simple_kernel_impl(
     int kv_start = kv_block_start;
     int kv_end = kv_block_end;
 
+    int partial_block_index = -1;
+    if (mask_type == BLOCK_MASK_PARTIAL) {
+      if (!has_partial_masks) {
+        continue;
+      }
+      partial_block_index =
+          partial_block_mask_indices[batch_id * block_mask_types_stride0 +
+                                     head_id * block_mask_types_stride1 +
+                                     q_block * block_mask_types_stride2 +
+                                     kv_idx * block_mask_types_stride3];
+      if (partial_block_index < 0) {
+        continue;
+      }
+    }
+
     if (mask_type == BLOCK_MASK_CAUSAL) {
       if (q_idx < kv_block_start) {
         continue;
       }
       kv_end = min(kv_end, q_idx + 1);
     }
-    
-    // PARTIAL blocks require per-token dense mask check
-    if (mask_type == BLOCK_MASK_PARTIAL && !has_dense_mask) {
-      continue;  // Skip if no dense mask provided
-    }
 
     for (int kv = kv_start; kv < kv_end; ++kv) {
-      // For PARTIAL blocks, check dense mask per-token
       if (mask_type == BLOCK_MASK_PARTIAL) {
-        int dense_mask_idx = batch_id * dense_mask_stride0 +
-                            head_id * dense_mask_stride1 +
-                            q_idx * dense_mask_stride2 +
-                            kv * dense_mask_stride3;
-        if (!dense_mask[dense_mask_idx]) {
-          continue;  // Skip masked positions in PARTIAL blocks
+        int local_q = q_idx - q_block * BLOCK_SIZE;
+        int local_kv = kv - kv_block * BLOCK_SIZE;
+        if (local_q < 0 || local_q >= BLOCK_SIZE || local_kv < 0 ||
+            local_kv >= BLOCK_SIZE) {
+          continue;
+        }
+        const int block_area = BLOCK_SIZE * BLOCK_SIZE;
+        int mask_offset =
+            partial_block_index * block_area + local_q * BLOCK_SIZE + local_kv;
+        if (!partial_block_masks[mask_offset]) {
+          continue;
         }
       }
-      
       // Explicit per-position causal check (defensive programming)
       // For CAUSAL blocks, ensure we only process kv <= q_idx
       if (mask_type == BLOCK_MASK_CAUSAL && kv > q_idx) {
@@ -278,7 +301,8 @@ void omni_attn_simple_kernel(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
     torch::Tensor block_mask_types, int BLOCK_SIZE, int seqlen_orig,
-    torch::Tensor dense_mask = torch::Tensor()) {  // Optional dense mask for PARTIAL blocks
+    torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
+    bool has_partial) {
   
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)
@@ -313,33 +337,32 @@ void omni_attn_simple_kernel(
     throw std::runtime_error(
         "Block mask tensors must be contiguous. Call .contiguous() before calling this function.");
   }
+
+  const bool has_partial_masks = has_partial;
   
-  // Check if dense_mask is provided and valid
-  bool has_dense_mask = dense_mask.defined() && dense_mask.numel() > 0;
-  if (has_dense_mask) {
-    CHECK_TORCH_TENSOR_DTYPE(dense_mask, torch::kBool)
-    if (dense_mask.dim() != 4 || dense_mask.size(0) != batch || 
-        dense_mask.size(1) != heads || dense_mask.size(2) != seqlen ||
-        dense_mask.size(3) != seqlen) {
+  if (has_partial_masks) {
+    if (!partial_block_mask_indices.is_contiguous() ||
+        !partial_block_masks.is_contiguous()) {
       throw std::runtime_error(
-          "dense_mask must have shape [batch, heads, seqlen, seqlen] matching Q/K/V");
+          "Partial block mask tensors must be contiguous.");
     }
-    if (!dense_mask.is_contiguous()) {
-      throw std::runtime_error("dense_mask must be contiguous");
-    }
+    CHECK_TORCH_TENSOR_DTYPE(partial_block_mask_indices, torch::kInt32)
+    CHECK_TORCH_TENSOR_DTYPE(partial_block_masks, torch::kBool)
   }
   
   const int total_q = batch * heads * seqlen;
   const int threads = 128;
   const int blocks = div_ceil(total_q, threads);
+  const int block_area = BLOCK_SIZE * BLOCK_SIZE;
   
-  // Get dense_mask data pointer and strides (or nullptr if not provided)
-  const bool *dense_mask_ptr = has_dense_mask ? 
-      reinterpret_cast<const bool *>(dense_mask.data_ptr()) : nullptr;
-  int dense_mask_stride0 = has_dense_mask ? dense_mask.stride(0) : 0;
-  int dense_mask_stride1 = has_dense_mask ? dense_mask.stride(1) : 0;
-  int dense_mask_stride2 = has_dense_mask ? dense_mask.stride(2) : 0;
-  int dense_mask_stride3 = has_dense_mask ? dense_mask.stride(3) : 0;
+  const int *partial_idx_ptr = has_partial_masks
+                                   ? reinterpret_cast<int *>(
+                                         partial_block_mask_indices.data_ptr())
+                                   : nullptr;
+  const bool *partial_masks_ptr = has_partial_masks
+                                      ? reinterpret_cast<bool *>(
+                                            partial_block_masks.data_ptr())
+                                      : nullptr;
   
   omni_attn_simple_kernel_impl<<<blocks, threads>>>(
       reinterpret_cast<half *>(Q.data_ptr()),
@@ -349,7 +372,8 @@ void omni_attn_simple_kernel(
       reinterpret_cast<int *>(kv_num_blocks.data_ptr()),
       reinterpret_cast<int *>(kv_indices.data_ptr()),
       reinterpret_cast<int *>(block_mask_types.data_ptr()),
-      dense_mask_ptr,
+      partial_idx_ptr,
+      partial_masks_ptr,
       seqlen,
       seqlen_orig,
       heads,
@@ -368,11 +392,7 @@ void omni_attn_simple_kernel(
       block_mask_types.stride(1),
       block_mask_types.stride(2),
       block_mask_types.stride(3),
-      dense_mask_stride0,
-      dense_mask_stride1,
-      dense_mask_stride2,
-      dense_mask_stride3,
-      has_dense_mask,
+      has_partial_masks,
       head_dim);
   
   cudaError_t err = cudaGetLastError();
