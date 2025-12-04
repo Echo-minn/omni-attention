@@ -55,24 +55,26 @@ class OmniBlockMask:
         block_mask_types: [batch, nheads, num_q_blocks, max_blocks] - mask type per block
         q_len: Original query sequence length
         kv_len: Original key/value sequence length
-        BLOCK_SIZE: Block size (default 128)
+        Q_BLOCK_SIZE: Block size for query (default 128)
+        KV_BLOCK_SIZE: Block size for key/value (default 128)
     """
     kv_num_blocks: Tensor  # [B, H, num_q_blocks]
     kv_indices: Tensor     # [B, H, num_q_blocks, max_blocks]
     block_mask_types: Tensor  # [B, H, num_q_blocks, max_blocks]
     q_len: int
     kv_len: int
-    BLOCK_SIZE: int = 128
+    Q_BLOCK_SIZE: int = 128
+    KV_BLOCK_SIZE: int = 128
     partial_block_mask_indices: Optional[Tensor] = None  # [B, H, num_q_blocks, max_blocks] or None
-    partial_block_masks: Optional[Tensor] = None  # [num_partial_blocks, BLOCK_SIZE, BLOCK_SIZE] or None
+    partial_block_masks: Optional[Tensor] = None  # [num_partial_blocks, Q_BLOCK_SIZE, KV_BLOCK_SIZE] or None
     
     @property
     def num_q_blocks(self) -> int:
-        return (self.q_len + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
+        return (self.q_len + self.Q_BLOCK_SIZE - 1) // self.Q_BLOCK_SIZE
     
     @property
     def num_kv_blocks(self) -> int:
-        return (self.kv_len + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
+        return (self.kv_len + self.KV_BLOCK_SIZE - 1) // self.KV_BLOCK_SIZE
     
     @property
     def device(self) -> torch.device:
@@ -99,8 +101,8 @@ class OmniBlockMask:
         for b in range(B):
             for h in range(H):
                 for q_block in range(num_q_blocks):
-                    q_start = q_block * self.BLOCK_SIZE
-                    q_end = min(q_start + self.BLOCK_SIZE, self.q_len)
+                    q_start = q_block * self.Q_BLOCK_SIZE
+                    q_end = min(q_start + self.Q_BLOCK_SIZE, self.q_len)
                     
                     num_active = self.kv_num_blocks[b, h, q_block].item()
                     
@@ -108,8 +110,8 @@ class OmniBlockMask:
                         kv_block = self.kv_indices[b, h, q_block, idx].item()
                         mask_type = self.block_mask_types[b, h, q_block, idx].item()
                         
-                        kv_start = kv_block * self.BLOCK_SIZE
-                        kv_end = min(kv_start + self.BLOCK_SIZE, self.kv_len)
+                        kv_start = kv_block * self.KV_BLOCK_SIZE
+                        kv_end = min(kv_start + self.KV_BLOCK_SIZE, self.kv_len)
                         
                         if mask_type == BlockMaskType.MASKED:
                             # Skip - already zeros
@@ -150,7 +152,8 @@ def build_partial_block_data(
     """Build per-block bitmasks for PARTIAL blocks from a dense mask."""
     B, H, num_q_blocks, max_blocks = block_mask.block_mask_types.shape
     device = dense_mask.device
-    BLOCK_SIZE = block_mask.BLOCK_SIZE
+    Q_BLOCK_SIZE = block_mask.Q_BLOCK_SIZE
+    KV_BLOCK_SIZE = block_mask.KV_BLOCK_SIZE
     
     # Ensure dense_mask matches padded lengths
     if dense_mask.shape[2] != block_mask.q_len or dense_mask.shape[3] != block_mask.kv_len:
@@ -171,18 +174,18 @@ def build_partial_block_data(
         for h in range(H):
             for q_block in range(num_q_blocks):
                 num_active = block_mask.kv_num_blocks[b, h, q_block].item()
-                q_start = q_block * BLOCK_SIZE
-                q_end = min(q_start + BLOCK_SIZE, block_mask.q_len)
+                q_start = q_block * Q_BLOCK_SIZE
+                q_end = min(q_start + Q_BLOCK_SIZE, block_mask.q_len)
                 for idx in range(num_active):
                     mask_type = block_mask.block_mask_types[b, h, q_block, idx].item()
                     if mask_type != BlockMaskType.PARTIAL:
                         continue
                     kv_block = block_mask.kv_indices[b, h, q_block, idx].item()
-                    kv_start = kv_block * BLOCK_SIZE
-                    kv_end = min(kv_start + BLOCK_SIZE, block_mask.kv_len)
+                    kv_start = kv_block * KV_BLOCK_SIZE
+                    kv_end = min(kv_start + KV_BLOCK_SIZE, block_mask.kv_len)
                     
                     block = torch.zeros(
-                        BLOCK_SIZE, BLOCK_SIZE, dtype=torch.bool, device=device
+                        Q_BLOCK_SIZE, KV_BLOCK_SIZE, dtype=torch.bool, device=device
                     )
                     q_len_block = q_end - q_start
                     kv_len_block = kv_end - kv_start
@@ -196,7 +199,7 @@ def build_partial_block_data(
         partial_mask_tensor = torch.stack(partial_masks, dim=0)
     else:
         partial_mask_tensor = torch.empty(
-            0, BLOCK_SIZE, BLOCK_SIZE, dtype=torch.bool, device=device
+            0, Q_BLOCK_SIZE, KV_BLOCK_SIZE, dtype=torch.bool, device=device
         )
     
     return partial_indices, partial_mask_tensor
@@ -234,12 +237,9 @@ def omni_block_mask_from_flex_block_mask(flex_block_mask) -> OmniBlockMask:
     """
     # Get dimensions
     q_len, kv_len = flex_block_mask.seq_lengths
-    if isinstance(flex_block_mask.BLOCK_SIZE, tuple):
-        q_block_size, kv_block_size = flex_block_mask.BLOCK_SIZE
-        assert q_block_size == kv_block_size, "Different Q/KV block sizes not supported"
-        block_size = q_block_size
-    else:
-        block_size = flex_block_mask.BLOCK_SIZE
+    
+    q_block_size = flex_block_mask.Q_BLOCK_SIZE
+    kv_block_size = flex_block_mask.KV_BLOCK_SIZE
     
     # Get kv_num_blocks and kv_indices
     kv_num_blocks = flex_block_mask.kv_num_blocks.clone()
@@ -285,7 +285,8 @@ def omni_block_mask_from_flex_block_mask(flex_block_mask) -> OmniBlockMask:
         block_mask_types=block_mask_types,
         q_len=q_len,
         kv_len=kv_len,
-        BLOCK_SIZE=block_size,
+        Q_BLOCK_SIZE=q_block_size,
+        KV_BLOCK_SIZE=kv_block_size,
     )
 
 
@@ -437,7 +438,7 @@ def flex_attention_with_block_mask(
         Q_LEN=Q,
         KV_LEN=KV,
         device=query.device,
-        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+        BLOCK_SIZE=(block_mask.Q_BLOCK_SIZE, block_mask.KV_BLOCK_SIZE),
     )
     
     # Run FlexAttention
@@ -488,7 +489,7 @@ def flex_attention_compiled(
         Q_LEN=Q,
         KV_LEN=KV,
         device=query.device,
-        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+        BLOCK_SIZE=(block_mask.Q_BLOCK_SIZE, block_mask.KV_BLOCK_SIZE),
     )
     
     # Compile flex_attention
@@ -576,11 +577,11 @@ def omni_attention_mma(
     assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
     assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
     
-    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # Pad to Q_BLOCK_SIZE and KV_BLOCK_SIZE multiples (like flex_attention does)
     # The mask is already created with padded length, so we just need to pad Q, K, V
-    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
-    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
-    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.Q_BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.KV_BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.KV_BLOCK_SIZE)
     
     Q_padded = query_padded.shape[2]
     KV_padded = key_padded.shape[2]
@@ -592,7 +593,7 @@ def omni_attention_mma(
         f"Padded KV length ({KV_padded}) doesn't match mask kv_len ({block_mask.kv_len})"
     
     # Validate block mask shapes
-    num_q_blocks = Q_padded // block_mask.BLOCK_SIZE
+    num_q_blocks = Q_padded // block_mask.Q_BLOCK_SIZE
     assert block_mask.kv_num_blocks.shape == (B, H, num_q_blocks), \
         f"kv_num_blocks shape mismatch: {block_mask.kv_num_blocks.shape} vs expected {(B, H, num_q_blocks)}"
     max_blocks = block_mask.kv_indices.shape[3]
@@ -621,11 +622,17 @@ def omni_attention_mma(
             f"Please use D that results in head_dim in [32, 64, 128] (e.g., D=256 with H=8 gives head_dim=32)."
         )
     
-    # Validate BLOCK_SIZE is supported (64 or 128)
-    if block_mask.BLOCK_SIZE not in [64, 128]:
+    # Validate Q_BLOCK_SIZE is supported (64 or 128)
+    if block_mask.Q_BLOCK_SIZE not in [64, 128]:
         raise ValueError(
-            f"Unsupported BLOCK_SIZE={block_mask.BLOCK_SIZE}. Supported values: 64, 128. "
-            f"Please use --block_size 64 or --block_size 128."
+            f"Unsupported Q_BLOCK_SIZE={block_mask.Q_BLOCK_SIZE}. Supported values: 64, 128. "
+            f"Please use --q_block_size 64 or --q_block_size 128."
+        )
+    
+    if block_mask.KV_BLOCK_SIZE not in [64, 128]:
+        raise ValueError(
+            f"Unsupported KV_BLOCK_SIZE={block_mask.KV_BLOCK_SIZE}. Supported values: 64, 128. "
+            f"Please use --kv_block_size 64 or --kv_block_size 128."
         )
     
     # TODO: Get partial mask information
@@ -644,7 +651,8 @@ def omni_attention_mma(
         kv_indices,
         block_mask_types,
         stages,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         q_orig_len,
         partial_block_mask_indices if has_partial else torch.empty(0, dtype=torch.int32, device=query_padded.device),
         partial_block_masks if has_partial else torch.empty(0, dtype=torch.bool, device=query_padded.device),
@@ -658,33 +666,6 @@ def omni_attention_mma(
     output = output_padded[:, :, :q_orig_len, :]
     
     return output
-
-
-def _pad_to_block_size(x: Tensor, BLOCK_SIZE: int) -> Tuple[Tensor, int]:
-    """Pad tensor's sequence dimension to multiple of BLOCK_SIZE.
-    
-    Args:
-        x: [..., seq_len, ...] tensor
-        BLOCK_SIZE: Block size to pad to
-        
-    Returns:
-        padded_x: Padded tensor
-        original_len: Original sequence length
-    """
-    *leading_dims, seq_len = x.shape[:-1]
-    head_dim = x.shape[-1]
-    
-    padded_len = ((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-    if padded_len == seq_len:
-        return x, seq_len
-    
-    padding_size = padded_len - seq_len
-    # Pad with zeros on the sequence dimension
-    padding = torch.zeros(*leading_dims, padding_size, head_dim, 
-                         device=x.device, dtype=x.dtype)
-    padded_x = torch.cat([x, padding], dim=-2)
-    return padded_x, seq_len
-
 
 def omni_attention_simple(
     query: Tensor,
@@ -749,11 +730,11 @@ def omni_attention_simple(
     assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
     assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
     
-    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # Pad to Q_BLOCK_SIZE and KV_BLOCK_SIZE multiples (like flex_attention does)
     # The mask is already created with padded length, so we just need to pad Q, K, V
-    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
-    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
-    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.Q_BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.KV_BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.KV_BLOCK_SIZE)
     
     Q_padded = query_padded.shape[2]
     KV_padded = key_padded.shape[2]
@@ -787,8 +768,8 @@ def omni_attention_simple(
     )
     partial_masks = torch.empty(
         0,
-        block_mask.BLOCK_SIZE,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         dtype=torch.bool,
         device=query_padded.device,
     )
@@ -806,7 +787,8 @@ def omni_attention_simple(
         kv_num_blocks,
         kv_indices,
         block_mask_types,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         q_orig_len,  # Original sequence length (before padding)
         partial_offsets,
         partial_masks,
@@ -886,11 +868,11 @@ def omni_attention_cp_async(
     assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
     assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
     
-    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # Pad to Q_BLOCK_SIZE and KV_BLOCK_SIZE multiples (like flex_attention does)
     # The mask is already created with padded length, so we just need to pad Q, K, V
-    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
-    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
-    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.Q_BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.KV_BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.KV_BLOCK_SIZE)
     
     Q_padded = query_padded.shape[2]
     KV_padded = key_padded.shape[2]
@@ -908,12 +890,17 @@ def omni_attention_cp_async(
             f"Please use D that results in head_dim in [32, 64, 128] (e.g., D=256 with H=8 gives head_dim=32)."
         )
     
-    # Validate BLOCK_SIZE is supported (64 or 128)
-    if block_mask.BLOCK_SIZE not in [64, 128]:
+    # Validate Q_BLOCK_SIZE is supported (64 or 128)
+    if block_mask.Q_BLOCK_SIZE not in [64, 128]:
         raise ValueError(
-            f"Unsupported BLOCK_SIZE={block_mask.BLOCK_SIZE}. Supported values: 64, 128."
+            f"Unsupported Q_BLOCK_SIZE={block_mask.Q_BLOCK_SIZE}. Supported values: 64, 128."
         )
-    
+    # Validate KV_BLOCK_SIZE is supported (64 or 128)
+    if block_mask.KV_BLOCK_SIZE not in [64, 128]:
+        raise ValueError(
+            f"Unsupported KV_BLOCK_SIZE={block_mask.KV_BLOCK_SIZE}. Supported values: 64, 128."
+        )
+
     # Ensure contiguous and correct dtype for Q, K, V
     query_padded = query_padded.contiguous().half()
     key_padded = key_padded.contiguous().half()
@@ -939,8 +926,8 @@ def omni_attention_cp_async(
     )
     partial_masks = torch.empty(
         0,
-        block_mask.BLOCK_SIZE,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         dtype=torch.bool,
         device=query_padded.device,
     )
@@ -956,7 +943,8 @@ def omni_attention_cp_async(
         kv_num_blocks,
         kv_indices,
         block_mask_types,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         q_orig_len,
         partial_offsets,
         partial_masks,
@@ -1023,11 +1011,11 @@ def omni_attention_preftech(
     assert value.shape == (B, H, KV, D), f"Value shape mismatch: {value.shape} vs expected {(B, H, KV, D)}"
     assert Q == KV, f"Q and KV sequence lengths must match: Q={Q}, KV={KV}"
     
-    # Pad to BLOCK_SIZE multiples (like flex_attention does)
+    # Pad to Q_BLOCK_SIZE and KV_BLOCK_SIZE multiples (like flex_attention does)
     # The mask is already created with padded length, so we just need to pad Q, K, V
-    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.BLOCK_SIZE)
-    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.BLOCK_SIZE)
-    value_padded, _ = _pad_to_block_size(value, block_mask.BLOCK_SIZE)
+    query_padded, q_orig_len = _pad_to_block_size(query, block_mask.Q_BLOCK_SIZE)
+    key_padded, kv_orig_len = _pad_to_block_size(key, block_mask.KV_BLOCK_SIZE)
+    value_padded, _ = _pad_to_block_size(value, block_mask.KV_BLOCK_SIZE)
     
     Q_padded = query_padded.shape[2]
     KV_padded = key_padded.shape[2]
@@ -1045,10 +1033,16 @@ def omni_attention_preftech(
             f"Please use D that results in head_dim in [32, 64, 128] (e.g., D=256 with H=8 gives head_dim=32)."
         )
     
-    # Validate BLOCK_SIZE is supported (64 or 128)
-    if block_mask.BLOCK_SIZE not in [64, 128]:
+    # Validate Q_BLOCK_SIZE is supported (64 or 128)
+    if block_mask.Q_BLOCK_SIZE not in [64, 128]:
         raise ValueError(
-            f"Unsupported BLOCK_SIZE={block_mask.BLOCK_SIZE}. Supported values: 64, 128."
+            f"Unsupported Q_BLOCK_SIZE={block_mask.Q_BLOCK_SIZE}. Supported values: 64, 128."
+        )
+    
+    # Validate KV_BLOCK_SIZE is supported (64 or 128)
+    if block_mask.KV_BLOCK_SIZE not in [64, 128]:
+        raise ValueError(
+            f"Unsupported KV_BLOCK_SIZE={block_mask.KV_BLOCK_SIZE}. Supported values: 64, 128."
         )
     
     # Ensure contiguous and correct dtype for Q, K, V
@@ -1076,8 +1070,8 @@ def omni_attention_preftech(
     )
     partial_masks = torch.empty(
         0,
-        block_mask.BLOCK_SIZE,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         dtype=torch.bool,
         device=query_padded.device,
     )
@@ -1093,7 +1087,8 @@ def omni_attention_preftech(
         kv_num_blocks,
         kv_indices,
         block_mask_types,
-        block_mask.BLOCK_SIZE,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
         q_orig_len,
         partial_offsets,
         partial_masks,
@@ -1111,6 +1106,33 @@ def omni_attention_preftech(
 # ============================================================================
 # Utility Functions
 # ============================================================================
+
+
+def _pad_to_block_size(x: Tensor, BLOCK_SIZE: int) -> Tuple[Tensor, int]:
+    """Pad tensor's sequence dimension to multiple of BLOCK_SIZE.
+    
+    Args:
+        x: [..., seq_len, ...] tensor
+        BLOCK_SIZE: Block size to pad to
+        
+    Returns:
+        padded_x: Padded tensor
+        original_len: Original sequence length
+    """
+    *leading_dims, seq_len = x.shape[:-1]
+    head_dim = x.shape[-1]
+    
+    padded_len = ((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    if padded_len == seq_len:
+        return x, seq_len
+    
+    padding_size = padded_len - seq_len
+    # Pad with zeros on the sequence dimension
+    padding = torch.zeros(*leading_dims, padding_size, head_dim, 
+                         device=x.device, dtype=x.dtype)
+    padded_x = torch.cat([x, padding], dim=-2)
+    return padded_x, seq_len
+
 
 def check_correctness(
     ref_output: Tensor,
@@ -1308,7 +1330,8 @@ def create_omni_block_mask_from_modality_positions(
     nheads: int,
     q_len: int,
     kv_len: int,
-    BLOCK_SIZE: int = 128,
+    Q_BLOCK_SIZE: int = 128,
+    KV_BLOCK_SIZE: int = 128,
     device: Union[str, torch.device] = "cuda",
 ) -> OmniBlockMask:
     """Create OmniBlockMask from modality positions.
@@ -1318,27 +1341,28 @@ def create_omni_block_mask_from_modality_positions(
     - Image modalities: FULL attention within same modality, FULL to all previous tokens
     - Different image modalities: MASKED (no attention between different images)
     
-    Like flex_attention, this function pads the sequence length to BLOCK_SIZE multiples
+    Like flex_attention, this function pads the sequence length to Q_BLOCK_SIZE and KV_BLOCK_SIZE multiples
     internally. The mask treats padding positions as masked (no attention).
     
     Args:
         modality_positions: [B, M, 3] tensor of (modality_type, offset, length)
         batch: Batch size
         nheads: Number of attention heads
-        q_len: Query sequence length (will be padded to BLOCK_SIZE multiple)
-        kv_len: Key/value sequence length (will be padded to BLOCK_SIZE multiple)
-        BLOCK_SIZE: Block size
+        q_len: Query sequence length (will be padded to Q_BLOCK_SIZE multiple)
+        kv_len: Key/value sequence length (will be padded to KV_BLOCK_SIZE multiple)
+        Q_BLOCK_SIZE: Block size for query
+        KV_BLOCK_SIZE: Block size for key/value
         device: Device
         
     Returns:
         OmniBlockMask with padded lengths
     """
     # Pad to BLOCK_SIZE multiples (like flex_attention does)
-    q_len_padded = ((q_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-    kv_len_padded = ((kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    q_len_padded = ((q_len + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE) * Q_BLOCK_SIZE
+    kv_len_padded = ((kv_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
     
-    num_q_blocks = q_len_padded // BLOCK_SIZE
-    num_kv_blocks = kv_len_padded // BLOCK_SIZE
+    num_q_blocks = q_len_padded // Q_BLOCK_SIZE
+    num_kv_blocks = kv_len_padded // KV_BLOCK_SIZE
     max_blocks = num_kv_blocks
     
     # Create token type array: 0 = text, 1+ = modality id
@@ -1373,8 +1397,8 @@ def create_omni_block_mask_from_modality_positions(
     block_mask_types = torch.zeros(batch, nheads, num_q_blocks, max_blocks, dtype=torch.int32, device=device)
     
     for q_block in range(num_q_blocks):
-        q_start = q_block * BLOCK_SIZE
-        q_end = min(q_start + BLOCK_SIZE, q_len_padded)
+        q_start = q_block * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, q_len_padded)
         q_effective_end = min(q_end, q_len)  # Effective end (excluding padding)
         
         for b in range(batch):
@@ -1392,8 +1416,8 @@ def create_omni_block_mask_from_modality_positions(
             
             num_active = 0
             for kv_block in range(num_kv_blocks):
-                kv_start = kv_block * BLOCK_SIZE
-                kv_end = min(kv_start + BLOCK_SIZE, kv_len_padded)
+                kv_start = kv_block * KV_BLOCK_SIZE
+                kv_end = min(kv_start + KV_BLOCK_SIZE, kv_len_padded)
                 kv_effective_end = min(kv_end, kv_len)  # Effective end (excluding padding)
                 
                 # Mask padding blocks (beyond original sequence length)
@@ -1500,7 +1524,8 @@ def create_omni_block_mask_from_modality_positions(
         block_mask_types=block_mask_types,
         q_len=q_len_padded,  # Return padded length
         kv_len=kv_len_padded,  # Return padded length
-        BLOCK_SIZE=BLOCK_SIZE,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
     )
     
     if (block_mask_types == BlockMaskType.PARTIAL).any():
@@ -1736,7 +1761,8 @@ def create_causal_omni_block_mask(
     nheads: int,
     q_len: int,
     kv_len: int,
-    BLOCK_SIZE: int = 128,
+    Q_BLOCK_SIZE: int = 128,
+    KV_BLOCK_SIZE: int = 128,
     device: Union[str, torch.device] = "cuda",
 ) -> OmniBlockMask:
     """Create a simple causal mask in OmniBlockMask format.
@@ -1749,20 +1775,21 @@ def create_causal_omni_block_mask(
     Args:
         batch: Batch size
         nheads: Number of attention heads
-        q_len: Query sequence length (will be padded to BLOCK_SIZE multiple)
-        kv_len: Key/value sequence length (will be padded to BLOCK_SIZE multiple)
-        BLOCK_SIZE: Block size
+        q_len: Query sequence length (will be padded to Q_BLOCK_SIZE multiple)
+        kv_len: Key/value sequence length (will be padded to KV_BLOCK_SIZE multiple)
+        Q_BLOCK_SIZE: Block size for query
+        KV_BLOCK_SIZE: Block size for key/value
         device: Device
         
     Returns:
         OmniBlockMask with causal attention pattern
     """
     # Pad to BLOCK_SIZE multiple
-    q_len_padded = ((q_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-    kv_len_padded = ((kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    q_len_padded = ((q_len + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE) * Q_BLOCK_SIZE
+    kv_len_padded = ((kv_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
     
-    num_q_blocks = q_len_padded // BLOCK_SIZE
-    num_kv_blocks = kv_len_padded // BLOCK_SIZE
+    num_q_blocks = q_len_padded // Q_BLOCK_SIZE
+    num_kv_blocks = kv_len_padded // KV_BLOCK_SIZE
     max_blocks = num_kv_blocks  # Maximum number of KV blocks any Q block can attend to
     
     # Initialize tensors
@@ -1792,7 +1819,8 @@ def create_causal_omni_block_mask(
         block_mask_types=block_mask_types,
         q_len=q_len_padded,
         kv_len=kv_len_padded,
-        BLOCK_SIZE=BLOCK_SIZE,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
     )
 
 def get_embeddings_from_text_and_images(
@@ -1843,7 +1871,8 @@ def print_block_structure(
     modality_positions: Tensor,
     q_len: int,
     batch_idx: int = 0,
-    BLOCK_SIZE: int = 128,
+    Q_BLOCK_SIZE: int = 128,
+    KV_BLOCK_SIZE: int = 128,
 ) -> None:
     """Print block structure in the format shown in the terminal.
     
@@ -1851,9 +1880,10 @@ def print_block_structure(
         modality_positions: [B, M, 3] tensor of (modality_type, offset, length)
         q_len: Sequence length
         batch_idx: Which batch to print
-        BLOCK_SIZE: Block size for mask computation
+        Q_BLOCK_SIZE: Block size for query
+        KV_BLOCK_SIZE: Block size for key/value
 
-    print something like(not in block size chunks):
+    print something like(not in Q_BLOCK_SIZE and KV_BLOCK_SIZE chunks):
 
     Modality ranges: 
     text[0:70] (len=70) 

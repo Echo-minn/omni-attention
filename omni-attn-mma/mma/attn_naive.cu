@@ -34,7 +34,8 @@ __global__ void omni_attn_simple_kernel_impl(
     int QKV_batch,
     int num_q_blocks,
     int max_blocks,
-    int BLOCK_SIZE,
+    int Q_BLOCK_SIZE,
+    int KV_BLOCK_SIZE,
     int kv_num_blocks_stride0,
     int kv_num_blocks_stride1,
     int kv_num_blocks_stride2,
@@ -70,8 +71,8 @@ __global__ void omni_attn_simple_kernel_impl(
     return;
   }
 
-  // Use BLOCK_SIZE directly (must match the BLOCK_SIZE used to create the mask)
-  int q_block = q_idx / BLOCK_SIZE;
+  // Use Q_BLOCK_SIZE directly (must match the Q_BLOCK_SIZE used to create the mask)
+  int q_block = q_idx / Q_BLOCK_SIZE;
   if (q_block >= num_q_blocks) {
     q_block = num_q_blocks - 1;
   }
@@ -108,8 +109,8 @@ __global__ void omni_attn_simple_kernel_impl(
       continue;
     }
 
-    int kv_block_start = kv_block * BLOCK_SIZE;
-    int kv_block_end = min(kv_block_start + BLOCK_SIZE, QKV_seqlen_orig);  // Bound by original length
+    int kv_block_start = kv_block * KV_BLOCK_SIZE;
+    int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, QKV_seqlen_orig);  // Bound by original length
 
     int kv_start = kv_block_start;
     int kv_end = kv_block_end;
@@ -140,15 +141,13 @@ __global__ void omni_attn_simple_kernel_impl(
 
     for (int kv = kv_start; kv < kv_end; ++kv) {
       if (mask_type == BLOCK_MASK_PARTIAL) {
-        int local_q = q_idx - q_block * BLOCK_SIZE;
-        int local_kv = kv - kv_block * BLOCK_SIZE;
-        if (local_q < 0 || local_q >= BLOCK_SIZE || local_kv < 0 ||
-            local_kv >= BLOCK_SIZE) {
+        int local_q = q_idx - q_block * Q_BLOCK_SIZE;
+        int local_kv = kv - kv_block * KV_BLOCK_SIZE;
+        if (local_q < 0 || local_q >= Q_BLOCK_SIZE || local_kv < 0 || local_kv >= KV_BLOCK_SIZE) {
           continue;
         }
-        const int block_area = BLOCK_SIZE * BLOCK_SIZE;
-        int mask_offset =
-            partial_block_index * block_area + local_q * BLOCK_SIZE + local_kv;
+        const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
+        int mask_offset = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
         if (!partial_block_masks[mask_offset]) {
           continue;
         }
@@ -211,8 +210,8 @@ __global__ void omni_attn_simple_kernel_impl(
       continue;
     }
 
-    int kv_block_start = kv_block * BLOCK_SIZE;
-    int kv_block_end = min(kv_block_start + BLOCK_SIZE, QKV_seqlen_orig);  // Bound by original length
+    int kv_block_start = kv_block * KV_BLOCK_SIZE;
+    int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, QKV_seqlen_orig);  // Bound by original length
 
     int kv_start = kv_block_start;
     int kv_end = kv_block_end;
@@ -241,15 +240,15 @@ __global__ void omni_attn_simple_kernel_impl(
 
     for (int kv = kv_start; kv < kv_end; ++kv) {
       if (mask_type == BLOCK_MASK_PARTIAL) {
-        int local_q = q_idx - q_block * BLOCK_SIZE;
-        int local_kv = kv - kv_block * BLOCK_SIZE;
-        if (local_q < 0 || local_q >= BLOCK_SIZE || local_kv < 0 ||
-            local_kv >= BLOCK_SIZE) {
+        int local_q = q_idx - q_block * Q_BLOCK_SIZE;
+        int local_kv = kv - kv_block * KV_BLOCK_SIZE;
+        if (local_q < 0 || local_q >= Q_BLOCK_SIZE || local_kv < 0 ||
+            local_kv >= KV_BLOCK_SIZE) {
           continue;
         }
-        const int block_area = BLOCK_SIZE * BLOCK_SIZE;
+        const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
         int mask_offset =
-            partial_block_index * block_area + local_q * BLOCK_SIZE + local_kv;
+            partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
         if (!partial_block_masks[mask_offset]) {
           continue;
         }
@@ -300,7 +299,7 @@ __global__ void omni_attn_simple_kernel_impl(
 void omni_attn_simple_kernel(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int BLOCK_SIZE, int seqlen_orig,
+    torch::Tensor block_mask_types, int Q_BLOCK_SIZE, int KV_BLOCK_SIZE, int seqlen_orig,
     torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
     bool has_partial) {
   
@@ -317,14 +316,14 @@ void omni_attn_simple_kernel(
   const int num_q_blocks = kv_num_blocks.size(2);
   const int max_blocks = kv_indices.size(3);
   
-  // Validate BLOCK_SIZE matches expected value
-  const int expected_num_q_blocks = (seqlen + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  // Validate Q_BLOCK_SIZE matches expected value
+  const int expected_num_q_blocks = (seqlen + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE;
   if (num_q_blocks != expected_num_q_blocks) {
     throw std::runtime_error(
         "Block mask num_q_blocks (" + std::to_string(num_q_blocks) + 
         ") does not match expected value (" + std::to_string(expected_num_q_blocks) + 
-        ") based on seqlen=" + std::to_string(seqlen) + " and BLOCK_SIZE=" + 
-        std::to_string(BLOCK_SIZE));
+        ") based on seqlen=" + std::to_string(seqlen) + " and Q_BLOCK_SIZE=" + 
+        std::to_string(Q_BLOCK_SIZE));
   }
   
   // Ensure tensors are contiguous
@@ -353,7 +352,7 @@ void omni_attn_simple_kernel(
   const int total_q = batch * heads * seqlen;
   const int threads = 128;
   const int blocks = div_ceil(total_q, threads);
-  const int block_area = BLOCK_SIZE * BLOCK_SIZE;
+  const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
   
   const int *partial_idx_ptr = has_partial_masks
                                    ? reinterpret_cast<int *>(
@@ -380,7 +379,8 @@ void omni_attn_simple_kernel(
       batch,
       num_q_blocks,
       max_blocks,
-      BLOCK_SIZE,
+      Q_BLOCK_SIZE,
+      KV_BLOCK_SIZE,
       kv_num_blocks.stride(0),
       kv_num_blocks.stride(1),
       kv_num_blocks.stride(2),

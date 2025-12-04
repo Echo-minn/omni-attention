@@ -300,7 +300,8 @@ __global__ void omni_attn_cp_async_kernel(
 void omni_attn_cp_async(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int BLOCK_SIZE, int seqlen_orig,
+    torch::Tensor block_mask_types, int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
+    int seqlen_orig,
     torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
     bool has_partial) {
   
@@ -314,22 +315,19 @@ void omni_attn_cp_async(
   const int seqlen = Q.size(2);
   const int head_dim = Q.size(3);
   
-  // Use BLOCK_SIZE from block mask (must match the BLOCK_SIZE used to create the mask)
+  // Use Q_BLOCK_SIZE from block mask (must match the Q_BLOCK_SIZE used to create the mask)
   const int num_q_blocks = kv_num_blocks.size(2);
   const int max_kv_blocks = kv_indices.size(3);
   
-  // Validate BLOCK_SIZE matches expected value
-  const int expected_num_q_blocks = (seqlen + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  // Validate Q_BLOCK_SIZE matches expected value
+  const int expected_num_q_blocks = (seqlen + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE;
   if (num_q_blocks != expected_num_q_blocks) {
     throw std::runtime_error(
         "Block mask num_q_blocks (" + std::to_string(num_q_blocks) + 
         ") does not match expected value (" + std::to_string(expected_num_q_blocks) + 
-        ") based on seqlen=" + std::to_string(seqlen) + " and BLOCK_SIZE=" + 
-        std::to_string(BLOCK_SIZE));
+        ") based on seqlen=" + std::to_string(seqlen) + " and Q_BLOCK_SIZE=" + 
+        std::to_string(Q_BLOCK_SIZE));
   }
-  
-  const int Q_BLOCK_SIZE = BLOCK_SIZE;
-  const int KV_BLOCK_SIZE = BLOCK_SIZE; // Assume same for now (as per user's assumption)
   
   // Ensure tensors are contiguous for simpler indexing
   // (This is a common requirement and simplifies the kernel significantly)
@@ -366,6 +364,11 @@ void omni_attn_cp_async(
   if (Q_BLOCK_SIZE != 64 && Q_BLOCK_SIZE != 128) {
     throw std::runtime_error(
         "Unsupported Q_BLOCK_SIZE=" + std::to_string(Q_BLOCK_SIZE) +
+        ". Supported values: 64, 128");
+  }
+  if (KV_BLOCK_SIZE != 64 && KV_BLOCK_SIZE != 128) {
+    throw std::runtime_error(
+        "Unsupported KV_BLOCK_SIZE=" + std::to_string(KV_BLOCK_SIZE) +
         ". Supported values: 64, 128");
   }
   

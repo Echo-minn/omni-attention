@@ -26,7 +26,7 @@ except ImportError:
     HAS_FLEX_ATTN = False
     print("Warning: flex_attention not available")
 
-def test_flex_attention(Q, K, V, dense_mask, reference_output, device="cuda"):
+def test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_block_size, device="cuda"):
     """Test flex_attention with fixed debug data."""
     if HAS_FLEX_ATTN and dense_mask is not None:
         print("\n" + "="*60)
@@ -47,6 +47,7 @@ def test_flex_attention(Q, K, V, dense_mask, reference_output, device="cuda"):
                 H=H,
                 Q_LEN=seq_len,
                 KV_LEN=seq_len,
+                BLOCK_SIZE=(q_block_size, kv_block_size),
                 device=device,
                 _compile=False,
             )
@@ -180,7 +181,6 @@ def test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output):
       
     return omni_output, omni_time
 
-
 def test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output):
     """Test omni_attention_preftech with fixed debug data."""
     print("\n" + "="*60)
@@ -227,14 +227,16 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     omni_block_mask = data['omni_block_mask']
     dense_mask = data.get('dense_mask', None)
     metadata = data['metadata']
+    q_block_size = omni_block_mask.Q_BLOCK_SIZE
+    kv_block_size = omni_block_mask.KV_BLOCK_SIZE
     
     print(f"\nTesting with fixed data:")
     print(f"  {metadata}")
-    print(f"  Q shape: {Q.shape}, dtype: {Q.dtype}")
+    print(f"  Q shape: {Q.shape}, dtype: {Q.dtype}; Q_BLOCK_SIZE: {q_block_size}, KV_BLOCK_SIZE: {kv_block_size}")
     print(f"  Reference output shape: {reference_output.shape}")
     
-    flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, device)
-    # omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
+    flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_block_size, device)
+    omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
     # omni_output, omni_time = test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output)
     omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
     # omni_output, omni_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)

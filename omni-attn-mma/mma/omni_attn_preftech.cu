@@ -568,7 +568,8 @@ omni_attn_prefetch(
 void omni_attn_preftech_kernel(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int BLOCK_SIZE,
+    torch::Tensor block_mask_types,
+    int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     int seqlen_orig,
     torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
     bool has_partial) {
@@ -584,17 +585,14 @@ void omni_attn_preftech_kernel(
   const int head_dim = Q.size(3);
   
   const int num_q_blocks = kv_num_blocks.size(2);
-  const int expected_num_q_blocks = (seqlen + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  const int expected_num_q_blocks = (seqlen + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE;
   if (num_q_blocks != expected_num_q_blocks) {
     throw std::runtime_error(
         "Block mask num_q_blocks (" + std::to_string(num_q_blocks) + 
         ") does not match expected value (" + std::to_string(expected_num_q_blocks) + 
-        ") based on seqlen=" + std::to_string(seqlen) + " and BLOCK_SIZE=" + 
-        std::to_string(BLOCK_SIZE));
+        ") based on seqlen=" + std::to_string(seqlen) + " and Q_BLOCK_SIZE=" + 
+        std::to_string(Q_BLOCK_SIZE));
   }
-  
-  const int Q_BLOCK_SIZE = BLOCK_SIZE;
-  const int KV_BLOCK_SIZE = BLOCK_SIZE;
   
   if (head_dim != 32 && head_dim != 64 && head_dim != 128) {
     throw std::runtime_error(

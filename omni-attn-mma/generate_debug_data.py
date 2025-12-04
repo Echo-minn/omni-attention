@@ -39,7 +39,8 @@ def generate_fixed_debug_causal_data(
     H=8,
     seq_len=512,
     head_dim=64,
-    BLOCK_SIZE=128,
+    Q_BLOCK_SIZE=128,
+    KV_BLOCK_SIZE=128,
     device="cuda",
     output_file="debug_data.pt",
     seed=42
@@ -51,7 +52,8 @@ def generate_fixed_debug_causal_data(
         H: Number of heads
         seq_len: Sequence length
         head_dim: Head dimension
-        BLOCK_SIZE: Block size for mask
+        Q_BLOCK_SIZE: Block size for query
+        KV_BLOCK_SIZE: Block size for key/value
         device: Device
         output_file: Output file path
         seed: Random seed for reproducibility
@@ -66,7 +68,7 @@ def generate_fixed_debug_causal_data(
         torch.cuda.manual_seed_all(seed)
     
     print(f"Generating fixed debug data:")
-    print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, BLOCK_SIZE={BLOCK_SIZE}")
+    print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, Q_BLOCK_SIZE={Q_BLOCK_SIZE}, KV_BLOCK_SIZE={KV_BLOCK_SIZE}")
     print(f"  seed={seed}, device={device}")
     
     # Generate fixed Q, K, V tensors
@@ -98,7 +100,8 @@ def generate_fixed_debug_causal_data(
         nheads=H,
         q_len=seq_len,
         kv_len=seq_len,
-        BLOCK_SIZE=BLOCK_SIZE,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
         device=device,
     )
     
@@ -131,7 +134,8 @@ def generate_fixed_debug_causal_data(
             'H': H,
             'seq_len': seq_len,
             'head_dim': head_dim,
-            'BLOCK_SIZE': BLOCK_SIZE,
+            'Q_BLOCK_SIZE': Q_BLOCK_SIZE,
+            'KV_BLOCK_SIZE': KV_BLOCK_SIZE,
             'seed': seed,
             'device': str(device),
         }
@@ -167,7 +171,8 @@ def generate_fixed_debug_F_C_data(
     H=8,
     seq_len=512,
     head_dim=64,
-    BLOCK_SIZE=128,
+    Q_BLOCK_SIZE=128,
+    KV_BLOCK_SIZE=128,
     device="cuda",
     output_file="debug_data_omni.pt",
     seed=42
@@ -176,6 +181,17 @@ def generate_fixed_debug_F_C_data(
     
     Each q_block attends to all previous kv_blocks (0 to q_block),
     with each block randomly assigned as FULL or CAUSAL.
+    
+    Args:
+        B: Batch size
+        H: Number of heads
+        seq_len: Sequence length
+        head_dim: Head dimension
+        Q_BLOCK_SIZE: Block size for query
+        KV_BLOCK_SIZE: Block size for key/value
+        device: Device
+        output_file: Output file path
+        seed: Random seed
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -183,17 +199,17 @@ def generate_fixed_debug_F_C_data(
         torch.cuda.manual_seed_all(seed)
     
     print(f"Generating random FULL/CAUSAL debug data:")
-    print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, BLOCK_SIZE={BLOCK_SIZE}")
+    print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, Q_BLOCK_SIZE={Q_BLOCK_SIZE}, KV_BLOCK_SIZE={KV_BLOCK_SIZE}")
     
     Q = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     K = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     V = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     
     # Create OmniBlockMask with random FULL/CAUSAL pattern
-    q_len_padded = ((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-    kv_len_padded = q_len_padded
-    num_q_blocks = q_len_padded // BLOCK_SIZE
-    num_kv_blocks = kv_len_padded // BLOCK_SIZE
+    q_len_padded = ((seq_len + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE) * Q_BLOCK_SIZE
+    kv_len_padded = ((seq_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
+    num_q_blocks = q_len_padded // Q_BLOCK_SIZE
+    num_kv_blocks = kv_len_padded // KV_BLOCK_SIZE
     max_blocks = num_kv_blocks
     
     kv_num_blocks = torch.zeros(B, H, num_q_blocks, dtype=torch.int32, device=device)
@@ -202,39 +218,54 @@ def generate_fixed_debug_F_C_data(
     
     # Generate random pattern: for each q_block, attend to all previous kv_blocks (0 to q_block)
     # Each block is randomly assigned as FULL or CAUSAL
+    # For causal attention: q_block i should attend to all kv_blocks j where kv_block j ends <= q_block i ends
     for q_block in range(num_q_blocks):
         num_active = 0
-        for kv_block in range(q_block + 1):
-            # Randomly choose FULL or CAUSAL (50/50)
-            mask_type = BlockMaskType.FULL if torch.rand(1).item() < 0.5 else BlockMaskType.CAUSAL
-            kv_indices[:, :, q_block, num_active] = kv_block
-            block_mask_types[:, :, q_block, num_active] = mask_type
-            num_active += 1
+        q_start = q_block * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, seq_len)
+        
+        # For causal attention, include all KV blocks that end before or at the end of this Q block
+        # This means: kv_end <= q_end (causal constraint)
+        for kv_block in range(num_kv_blocks):
+            kv_start = kv_block * KV_BLOCK_SIZE
+            kv_end = min(kv_start + KV_BLOCK_SIZE, seq_len)
+            
+            # Include KV block if it ends before or at the end of this Q block (causal constraint)
+            if kv_end <= q_end:
+                # Randomly choose FULL or CAUSAL (50/50)
+                mask_type = BlockMaskType.FULL if torch.rand(1).item() < 0.5 else BlockMaskType.CAUSAL
+                kv_indices[:, :, q_block, num_active] = kv_block
+                block_mask_types[:, :, q_block, num_active] = mask_type
+                num_active += 1
+        
         kv_num_blocks[:, :, q_block] = num_active
         block_mask_types[:, :, q_block, num_active:] = BlockMaskType.MASKED
     
+    # Use Q_BLOCK_SIZE as the primary BLOCK_SIZE for OmniBlockMask
+    # (The mask structure uses Q blocks as the primary dimension)
     omni_block_mask = OmniBlockMask(
         kv_num_blocks=kv_num_blocks,
         kv_indices=kv_indices,
         block_mask_types=block_mask_types,
         q_len=seq_len,
         kv_len=seq_len,
-        BLOCK_SIZE=BLOCK_SIZE,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
     )
     
     # Create dense mask from block pattern
     dense_mask = torch.zeros(B, H, seq_len, seq_len, device=device, dtype=torch.bool)
     
     for q_block in range(num_q_blocks):
-        q_start = q_block * BLOCK_SIZE
-        q_end = min(q_start + BLOCK_SIZE, seq_len)
+        q_start = q_block * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, seq_len)
         num_active = kv_num_blocks[0, 0, q_block].item()
         
         for i in range(num_active):
             kv_block = kv_indices[0, 0, q_block, i].item()
             mask_type = block_mask_types[0, 0, q_block, i].item()
-            kv_start = kv_block * BLOCK_SIZE
-            kv_end = min(kv_start + BLOCK_SIZE, seq_len)
+            kv_start = kv_block * KV_BLOCK_SIZE
+            kv_end = min(kv_start + KV_BLOCK_SIZE, seq_len)
             
             if mask_type == BlockMaskType.FULL:
                 # Full attention: all q can attend to all kv in this block
@@ -270,7 +301,8 @@ def generate_fixed_debug_F_C_data(
         'omni_block_mask': omni_block_mask,
         'metadata': {
             'B': B, 'H': H, 'seq_len': seq_len, 'head_dim': head_dim,
-            'BLOCK_SIZE': BLOCK_SIZE, 'seed': seed, 'device': str(device),
+            'Q_BLOCK_SIZE': Q_BLOCK_SIZE, 'KV_BLOCK_SIZE': KV_BLOCK_SIZE,
+            'seed': seed, 'device': str(device),
             'pattern': 'random_full_causal',
         }
     }
@@ -288,7 +320,8 @@ def generate_fixed_debug_partial_data(
     H=8,
     seq_len=512,
     head_dim=64,
-    BLOCK_SIZE=128,
+    Q_BLOCK_SIZE=128,
+    KV_BLOCK_SIZE=128,
     device="cuda",
     output_file="debug_data_partial.pt",
     seed=42
@@ -296,6 +329,17 @@ def generate_fixed_debug_partial_data(
     """
     Generate fixed debug data with PARTIAL block pattern.
     with each block randomly assigned as FULL, CAUSAL, or PARTIAL.
+    
+    Args:
+        B: Batch size
+        H: Number of heads
+        seq_len: Sequence length
+        head_dim: Head dimension
+        Q_BLOCK_SIZE: Block size for query
+        KV_BLOCK_SIZE: Block size for key/value
+        device: Device
+        output_file: Output file path
+        seed: Random seed
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -303,17 +347,17 @@ def generate_fixed_debug_partial_data(
         torch.cuda.manual_seed_all(seed)
     
     print(f"Generating random FULL/CAUSAL/PARTIAL debug data:")
-    print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, BLOCK_SIZE={BLOCK_SIZE}")
+    print(f"  B={B}, H={H}, seq_len={seq_len}, head_dim={head_dim}, Q_BLOCK_SIZE={Q_BLOCK_SIZE}, KV_BLOCK_SIZE={KV_BLOCK_SIZE}")
     
     Q = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     K = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     V = torch.randn(B, H, seq_len, head_dim, device=device, dtype=torch.float32)
     
     # Create OmniBlockMask with random pattern
-    q_len_padded = ((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-    kv_len_padded = q_len_padded
-    num_q_blocks = q_len_padded // BLOCK_SIZE
-    num_kv_blocks = kv_len_padded // BLOCK_SIZE
+    q_len_padded = ((seq_len + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE) * Q_BLOCK_SIZE
+    kv_len_padded = ((seq_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
+    num_q_blocks = q_len_padded // Q_BLOCK_SIZE
+    num_kv_blocks = kv_len_padded // KV_BLOCK_SIZE
     max_blocks = num_kv_blocks
     
     kv_num_blocks = torch.zeros(B, H, num_q_blocks, dtype=torch.int32, device=device)
@@ -321,30 +365,44 @@ def generate_fixed_debug_partial_data(
     block_mask_types = torch.zeros(B, H, num_q_blocks, max_blocks, dtype=torch.int32, device=device)
     
     # Generate random pattern: for each q_block, randomly assign FULL/CAUSAL/PARTIAL to each kv_block
+    # For causal attention: q_block i should attend to all kv_blocks j where kv_block j ends <= q_block i ends
     for q_block in range(num_q_blocks):
         num_active = 0
-        for kv_block in range(q_block + 1):
-            # Randomly choose FULL, CAUSAL, or PARTIAL (1/3 each)
-            rand_val = torch.rand(1).item()
-            if rand_val < 0.333:
-                mask_type = BlockMaskType.FULL
-            elif rand_val < 0.666:
-                mask_type = BlockMaskType.CAUSAL
-            else:
-                mask_type = BlockMaskType.PARTIAL
-            kv_indices[:, :, q_block, num_active] = kv_block
-            block_mask_types[:, :, q_block, num_active] = mask_type
-            num_active += 1
+        q_start = q_block * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, seq_len)
+        
+        # For causal attention, include all KV blocks that end before or at the end of this Q block
+        # This means: kv_end <= q_end (causal constraint)
+        for kv_block in range(num_kv_blocks):
+            kv_start = kv_block * KV_BLOCK_SIZE
+            kv_end = min(kv_start + KV_BLOCK_SIZE, seq_len)
+            
+            # Include KV block if it ends before or at the end of this Q block (causal constraint)
+            if kv_end <= q_end:
+                # Randomly choose FULL, CAUSAL, or PARTIAL (1/3 each)
+                rand_val = torch.rand(1).item()
+                if rand_val < 0.333:
+                    mask_type = BlockMaskType.FULL
+                elif rand_val < 0.666:
+                    mask_type = BlockMaskType.CAUSAL
+                else:
+                    mask_type = BlockMaskType.PARTIAL
+                kv_indices[:, :, q_block, num_active] = kv_block
+                block_mask_types[:, :, q_block, num_active] = mask_type
+                num_active += 1
+        
         kv_num_blocks[:, :, q_block] = num_active
         block_mask_types[:, :, q_block, num_active:] = BlockMaskType.MASKED
     
+    # Use Q_BLOCK_SIZE as the primary BLOCK_SIZE for OmniBlockMask
     omni_block_mask = OmniBlockMask(
         kv_num_blocks=kv_num_blocks,
         kv_indices=kv_indices,
         block_mask_types=block_mask_types,
         q_len=seq_len,
         kv_len=seq_len,
-        BLOCK_SIZE=BLOCK_SIZE,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
     )
     
     # Create dense mask from block pattern
@@ -352,15 +410,15 @@ def generate_fixed_debug_partial_data(
     dense_mask = torch.zeros(B, H, seq_len, seq_len, device=device, dtype=torch.bool)
     
     for q_block in range(num_q_blocks):
-        q_start = q_block * BLOCK_SIZE
-        q_end = min(q_start + BLOCK_SIZE, seq_len)
+        q_start = q_block * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, seq_len)
         num_active = kv_num_blocks[0, 0, q_block].item()
         
         for i in range(num_active):
             kv_block = kv_indices[0, 0, q_block, i].item()
             mask_type = block_mask_types[0, 0, q_block, i].item()
-            kv_start = kv_block * BLOCK_SIZE
-            kv_end = min(kv_start + BLOCK_SIZE, seq_len)
+            kv_start = kv_block * KV_BLOCK_SIZE
+            kv_end = min(kv_start + KV_BLOCK_SIZE, seq_len)
             
             if mask_type == BlockMaskType.FULL:
                 # Full attention: all q can attend to all kv in this block
@@ -409,7 +467,8 @@ def generate_fixed_debug_partial_data(
         'omni_block_mask': omni_block_mask,
         'metadata': {
             'B': B, 'H': H, 'seq_len': seq_len, 'head_dim': head_dim,
-            'BLOCK_SIZE': BLOCK_SIZE, 'seed': seed, 'device': str(device),
+            'Q_BLOCK_SIZE': Q_BLOCK_SIZE, 'KV_BLOCK_SIZE': KV_BLOCK_SIZE,
+            'seed': seed, 'device': str(device),
             'pattern': 'random_full_causal_partial',
         }
     }
@@ -430,7 +489,8 @@ if __name__ == "__main__":
     parser.add_argument('--H', type=int, default=8, help='Number of heads')
     parser.add_argument('--seq_len', type=int, default=512, help='Sequence length')
     parser.add_argument('--head_dim', type=int, default=64, help='Head dimension')
-    parser.add_argument('--BLOCK_SIZE', type=int, default=128, help='Block size')
+    parser.add_argument('--Q_BLOCK_SIZE', type=int, default=128, help='Block size for query')
+    parser.add_argument('--KV_BLOCK_SIZE', type=int, default=128, help='Block size for key/value')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output', type=str, default='debug_data.pt', help='Output file')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
@@ -442,31 +502,34 @@ if __name__ == "__main__":
     #     H=args.H,
     #     seq_len=args.seq_len,
     #     head_dim=args.head_dim,
-    #     BLOCK_SIZE=args.BLOCK_SIZE,
+    #     Q_BLOCK_SIZE=args.Q_BLOCK_SIZE,
+    #     KV_BLOCK_SIZE=args.KV_BLOCK_SIZE,
     #     device=args.device,
     #     output_file='data/1024/debug_data.pt',
     #     seed=args.seed,
     # )
 
-    generate_fixed_debug_F_C_data(
-        B=args.B,
-        H=args.H,
-        seq_len=args.seq_len,
-        head_dim=args.head_dim,
-        BLOCK_SIZE=args.BLOCK_SIZE,
-        device=args.device,
-        output_file='data/1024/debug_data_F_C.pt',
-        seed=args.seed,
-    )
-
-    # generate_fixed_debug_partial_data(
+    # generate_fixed_debug_F_C_data(
     #     B=args.B,
     #     H=args.H,
     #     seq_len=args.seq_len,
     #     head_dim=args.head_dim,
-    #     BLOCK_SIZE=args.BLOCK_SIZE,
+    #     Q_BLOCK_SIZE=args.Q_BLOCK_SIZE,
+    #     KV_BLOCK_SIZE=args.KV_BLOCK_SIZE,
     #     device=args.device,
-    #     output_file='data/1024/debug_data_partial.pt',
+    #     output_file='data/1024/debug_data_F_C.pt',
     #     seed=args.seed,
     # )
+
+    generate_fixed_debug_partial_data(
+        B=args.B,
+        H=args.H,
+        seq_len=args.seq_len,
+        head_dim=args.head_dim,
+        Q_BLOCK_SIZE=args.Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=args.KV_BLOCK_SIZE,
+        device=args.device,
+        output_file='data/1024/debug_data_partial.pt',
+        seed=args.seed,
+    )
 
