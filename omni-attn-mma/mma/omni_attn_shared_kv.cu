@@ -168,6 +168,7 @@ omni_attn_shared_kv(
       if (!has_partial_masks || partial_block_mask_indices == nullptr) {
         continue;
       }
+      // block_mask_types stride should be the same as partial_block_mask_indices stride
       partial_block_index = partial_block_mask_indices[QKV_batch_id * block_mask_types_stride0 +
                                                        QKV_head_id * block_mask_types_stride1 +
                                                        q_block * block_mask_types_stride2 +

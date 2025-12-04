@@ -84,7 +84,6 @@ def get_build_sources():
     build_sources.append("./mma/basic/flash_attn_mma_split_kv.cu")
     build_sources.append("./mma/basic/flash_attn_mma_split_q.cu")
     build_sources.append("./mma/basic/flash_attn_mma_share_kv.cu")
-    build_sources.append("./mma/basic/omni_attn_mma_share_kv.cu")
     build_sources.append("./mma/basic/flash_attn_mma_share_qkv.cu")
     build_sources.append("./mma/basic/flash_attn_mma_tiling_qk.cu")
     build_sources.append("./mma/basic/flash_attn_mma_tiling_qkv.cu")

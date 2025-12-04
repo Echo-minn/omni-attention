@@ -228,11 +228,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
   // load Q from gmem -> smem, only load once.
   {
     int load_gmem_Q_d = load_smem_Q_d;
-    int load_gmem_Q_addr =
-        (Q_gmem_offset + load_gmem_Q_Br * kHeadDim + load_gmem_Q_d);
-    uint32_t load_smem_Q_ptr =
-        (smem_Q_base_ptr +
-         (load_smem_Q_Br * (kHeadDim + kPadQ) + load_smem_Q_d) * sizeof(half));
+    int load_gmem_Q_addr = (Q_gmem_offset + load_gmem_Q_Br * kHeadDim + load_gmem_Q_d);
+    uint32_t load_smem_Q_ptr = (smem_Q_base_ptr + (load_smem_Q_Br * (kHeadDim + kPadQ) + load_smem_Q_d) * sizeof(half));
 #pragma unroll
     for (int i = 0; i < (kHeadDim / (kNumThreads / Br)); i += 8) {
       CP_ASYNC_CG(load_smem_Q_ptr + i * 2, &Q[load_gmem_Q_addr + i], 16);
@@ -296,8 +293,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
           tile_K_seqlen * Bc; // e.g (0~3)*64=(0,64,128,192,...)
       int load_gmem_K_Bc = load_gmem_K_Bc_offset + load_smem_K_Bc;
       int load_gmem_K_d = load_smem_K_d;
-      int load_gmem_K_addr =
-          (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
+      int load_gmem_K_addr = (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
       uint32_t load_smem_K_ptr =
           (smem_K_base_ptr +
            (kPrefetchKg2sSmemId * K_tile_size +
@@ -361,8 +357,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         // load Q from smem -> regs in each loop w/o prefetch Q s2r.
         #pragma unroll
         for (int i = 0; i < kWarpTileSeqLenQ; ++i) { // Q[Br,d]=[M,K]
-          int warp_smem_Q_Br =
-              warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
+          int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
           int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;            // 0~15
           int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8; // 0,8
           uint32_t lane_smem_Q_ptr =
@@ -456,17 +451,11 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     // <w/o Prefetch V g2s>: If kCanPrefetchKVg2s is not enable,
     // we will load V g2s here, before rowmax and rowsum.
     if constexpr (!kCanPrefetchKVg2s) {
-      load_gmem_V_Bc_offset =
-          tile_K_seqlen * Bc; // e.g (0~3)*64=(0,64,128,192,...)
+      load_gmem_V_Bc_offset = tile_K_seqlen * Bc; // e.g (0~3)*64=(0,64,128,192,...)
       int load_gmem_V_Bc = load_gmem_V_Bc_offset + load_smem_V_Bc;
       int load_gmem_V_d = load_smem_V_d;
-      int load_gmem_V_addr =
-          (V_gmem_offset + load_gmem_V_Bc * kHeadDim + load_gmem_V_d);
-      uint32_t load_smem_V_ptr =
-          (smem_V_base_ptr +
-           (kPrefetchVg2sSmemId * V_tile_size +
-            load_smem_V_Bc * (kHeadDim + kPadV) + load_smem_V_d) *
-               sizeof(half));
+      int load_gmem_V_addr = (V_gmem_offset + load_gmem_V_Bc * kHeadDim + load_gmem_V_d);
+      uint32_t load_smem_V_ptr = (smem_V_base_ptr + (kPrefetchVg2sSmemId * V_tile_size + load_smem_V_Bc * (kHeadDim + kPadV) + load_smem_V_d) * sizeof(half));
       #pragma unroll
       for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
         CP_ASYNC_CG(load_smem_V_ptr + i * 2, &V[load_gmem_V_addr + i], 16);
@@ -596,8 +585,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     // Here, we have to wait V ready before compute O = P @ V
     if constexpr (kCanPrefetchKVg2s) {
       if ((tile_K_seqlen + 1) < Tc) {
-        CP_ASYNC_WAIT_GROUP(
-            1); // we have send V & K g2s, wait V and let K async.
+        CP_ASYNC_WAIT_GROUP(1); // we have send V & K g2s, wait V and let K async.
       } else {
         CP_ASYNC_WAIT_GROUP(0); // we have only send V g2s.
       }
@@ -640,10 +628,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       // Load k16n8 V from smem -> regs, R_KV, ldmatrix.x2.trans.
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-        int warp_smem_V_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) +
-                            j * kMmaAtomN; // d, matmaul N
-        int lane_smem_V_Bc =
-            tile_V_Bc * kMmaAtomK + lane_id % 16; // 0~15; Bc, matmul K
+        int warp_smem_V_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN; // d, matmaul N
+        int lane_smem_V_Bc = tile_V_Bc * kMmaAtomK + lane_id % 16; // 0~15; Bc, matmul K
         int lane_smem_V_d = warp_smem_V_d;        // 0
         uint32_t lane_smem_V_ptr =
             (smem_V_base_ptr +

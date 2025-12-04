@@ -236,8 +236,8 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, device)
     # omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
     # omni_output, omni_time = test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output)
-    # omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
-    omni_output, omni_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)
+    omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
+    # omni_output, omni_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)
 
     # Compare omni vs flex
     if omni_output is not None:
