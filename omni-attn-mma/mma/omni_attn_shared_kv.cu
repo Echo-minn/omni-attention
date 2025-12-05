@@ -157,23 +157,18 @@ omni_attn_shared_kv(
                                     q_block * block_mask_types_stride2 +
                                     kv_idx * block_mask_types_stride3];
 
-    // Skip if masked
+
     if (mask_type == BLOCK_MASK_MASKED) {
       continue;
     }
 
-    // Get partial block index if needed
     int partial_block_index = -1;
-    if (mask_type == BLOCK_MASK_PARTIAL) {
-      if (!has_partial_masks || partial_block_mask_indices == nullptr) {
-        continue;
-      }
-      // block_mask_types stride should be the same as partial_block_mask_indices stride
+    if (has_partial_masks && partial_block_mask_indices != nullptr) {
       partial_block_index = partial_block_mask_indices[QKV_batch_id * block_mask_types_stride0 +
                                                        QKV_head_id * block_mask_types_stride1 +
                                                        q_block * block_mask_types_stride2 +
                                                        kv_idx * block_mask_types_stride3];
-      if (partial_block_index < 0) {
+      if (mask_type == BLOCK_MASK_PARTIAL && partial_block_index < 0) {
         continue;
       }
     }
@@ -181,31 +176,29 @@ omni_attn_shared_kv(
     // Compute KV block boundaries
     int kv_block_start = kv_block * KV_BLOCK_SIZE;
     int kv_block_end = min(kv_block_start + KV_BLOCK_SIZE, QKV_seqlen_orig);
-    
-    // for each KV block(KV_BLOCK_SIZE)
-    // load K from gmem -> smem
+  
+    // load K from gmem -> smem, for each KV block(KV_BLOCK_SIZE)
     {
-      int load_gmem_K_Bc = kv_block_start + load_smem_K_Bc;
-      if (load_smem_K_Bc < Bc) {
-        int load_gmem_K_d = load_smem_K_d;
-        if (load_gmem_K_Bc < kv_block_end) {
-          int load_gmem_K_addr = (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
-          uint32_t load_smem_K_ptr = (smem_K_base_ptr + (load_smem_K_Bc * (kHeadDim + kPadK) + load_smem_K_d) * sizeof(half));
-          #pragma unroll
-          for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
-            CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
-          }
-          CP_ASYNC_COMMIT_GROUP();
+    int load_gmem_K_Bc = kv_block_start + load_smem_K_Bc;
+    if (load_smem_K_Bc < Bc) {
+      int load_gmem_K_d = load_smem_K_d;
+      if (load_gmem_K_Bc < kv_block_end) {
+        int load_gmem_K_addr = (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
+        uint32_t load_smem_K_ptr = (smem_K_base_ptr + (load_smem_K_Bc * (kHeadDim + kPadK) + load_smem_K_d) * sizeof(half));
+        #pragma unroll
+        for (int i = 0; i < (kHeadDim / (kNumThreads / Bc)); i += 8) {
+          CP_ASYNC_CG(load_smem_K_ptr + i * 2, &K[load_gmem_K_addr + i], 16);
         }
+        CP_ASYNC_COMMIT_GROUP();
+      }
       }
     }
-    
+  
     // Wait for K to be ready
     CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
-    // compute S = Q @ K^T
-    // compute with multiple MMA tiles(m16n8k16)
+    // compute S = Q @ K^T with multiple MMA tiles(m16n8k16)
     fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
     #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
@@ -237,7 +230,7 @@ omni_attn_shared_kv(
     }
     __syncthreads();
 
-    // Apply scale to scores
+    // Apply scale to scores FIRST (before masking, matching omni_attn_preftech.cu)
     #pragma unroll
     for (int j = 0; j < kWarpTileSeqLenK; ++j) {
       half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
@@ -247,48 +240,57 @@ omni_attn_shared_kv(
       S[3] = __hmul(S[3], __float2half(scale));
     }
 
-    // Apply causal mask if needed
+    // Apply causal mask if needed (AFTER scaling)
     if (mask_type == BLOCK_MASK_CAUSAL) {
       int q_base = Q_tile_id * Br;
       int kv_base = kv_block * KV_BLOCK_SIZE;
-      int row_in_tile = lane_id % 8;
-      int col_pair = (lane_id / 8) * 2;
+      
+      int row_in_warp = lane_id % 16;
+      int row_pair_idx = row_in_warp / 2;
+      int row0 = q_base + warp_QP * kMmaAtomM + row_pair_idx * 2;
+      int row1 = row0 + 1;
       
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        int q_row_0 = q_base + row_in_tile;
-        int q_row_1 = q_base + row_in_tile + 8;
-        int kv_col = kv_base + j * kMmaAtomN + col_pair;
+        int col_in_tile = lane_id % 8;
+        int col_pair = col_in_tile / 2;
+        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair * 2;
+        int kv_col_1 = kv_col_0 + 1;
         
         half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
-        if (q_row_0 < kv_col)     S[0] = __float2half(-INFINITY);
-        if (q_row_0 < kv_col + 1) S[1] = __float2half(-INFINITY);
-        if (q_row_1 < kv_col)     S[2] = __float2half(-INFINITY);
-        if (q_row_1 < kv_col + 1) S[3] = __float2half(-INFINITY);
+        if (row0 < kv_col_0)     S[0] = __float2half(-INFINITY);
+        if (row0 < kv_col_1)     S[1] = __float2half(-INFINITY);
+        if (row1 < kv_col_0)     S[2] = __float2half(-INFINITY);
+        if (row1 < kv_col_1)     S[3] = __float2half(-INFINITY);
       }
     }
 
-    // Apply partial mask if needed
-    if (mask_type == BLOCK_MASK_PARTIAL && has_partial_masks && partial_block_masks != nullptr) {
+    // Apply partial mask if needed (AFTER scaling, for PARTIAL blocks with valid partial mask data)
+    if (mask_type == BLOCK_MASK_PARTIAL && has_partial_masks && partial_block_masks != nullptr && partial_block_index >= 0) {
       int q_base = Q_tile_id * Br;
       int kv_base = kv_block * KV_BLOCK_SIZE;
       int q_block_start = q_block * Q_BLOCK_SIZE;
-      int row_in_tile = lane_id % 8;
-      int col_pair = (lane_id / 8) * 2;
+      // Match Q loading pattern: row_in_warp = lane_id % 16
+      int row_in_warp = lane_id % 16;  // 0-15, matches lane_smem_Q_Br calculation
+      int row_pair_idx = row_in_warp / 2;  // 0,0,1,1,2,2,...,7,7
+      int row0 = q_base + warp_QP * kMmaAtomM + row_pair_idx * 2;
+      int row1 = row0 + 1;
+      // Column calculation: match K loading pattern (same as causal mask)
       const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
       
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        int q_row_0 = q_base + row_in_tile;
-        int q_row_1 = q_base + row_in_tile + 8;
-        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair;
+        // Match K loading pattern (same as causal mask)
+        int col_in_tile = lane_id % 8;  // 0-7
+        int col_pair = col_in_tile / 2;  // 0,0,1,1,2,2,3,3 -> pairs (0,1), (2,3), (4,5), (6,7)
+        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair * 2;
         int kv_col_1 = kv_col_0 + 1;
         
         half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
         
-        // Check mask for (q_row_0, kv_col_0)
-        if (q_row_0 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
-          int local_q_0 = q_row_0 - q_block_start;
+        // Check mask for (row0, kv_col_0)
+        if (row0 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
+          int local_q_0 = row0 - q_block_start;
           int local_kv_0 = kv_col_0 - kv_base;
           if (local_q_0 >= 0 && local_q_0 < Q_BLOCK_SIZE && local_kv_0 >= 0 && local_kv_0 < KV_BLOCK_SIZE) {
             int mask_offset_0 = partial_block_index * block_area + local_q_0 * KV_BLOCK_SIZE + local_kv_0;
@@ -298,9 +300,9 @@ omni_attn_shared_kv(
           }
         }
         
-        // Check mask for (q_row_0, kv_col_1)
-        if (q_row_0 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
-          int local_q_0 = q_row_0 - q_block_start;
+        // Check mask for (row0, kv_col_1)
+        if (row0 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
+          int local_q_0 = row0 - q_block_start;
           int local_kv_1 = kv_col_1 - kv_base;
           if (local_q_0 >= 0 && local_q_0 < Q_BLOCK_SIZE && local_kv_1 >= 0 && local_kv_1 < KV_BLOCK_SIZE) {
             int mask_offset_1 = partial_block_index * block_area + local_q_0 * KV_BLOCK_SIZE + local_kv_1;
@@ -310,9 +312,9 @@ omni_attn_shared_kv(
           }
         }
         
-        // Check mask for (q_row_1, kv_col_0)
-        if (q_row_1 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
-          int local_q_1 = q_row_1 - q_block_start;
+        // Check mask for (row1, kv_col_0)
+        if (row1 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
+          int local_q_1 = row1 - q_block_start;
           int local_kv_0 = kv_col_0 - kv_base;
           if (local_q_1 >= 0 && local_q_1 < Q_BLOCK_SIZE && local_kv_0 >= 0 && local_kv_0 < KV_BLOCK_SIZE) {
             int mask_offset_2 = partial_block_index * block_area + local_q_1 * KV_BLOCK_SIZE + local_kv_0;
@@ -322,9 +324,9 @@ omni_attn_shared_kv(
           }
         }
         
-        // Check mask for (q_row_1, kv_col_1)
-        if (q_row_1 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
-          int local_q_1 = q_row_1 - q_block_start;
+        // Check mask for (row1, kv_col_1)
+        if (row1 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
+          int local_q_1 = row1 - q_block_start;
           int local_kv_1 = kv_col_1 - kv_base;
           if (local_q_1 >= 0 && local_q_1 < Q_BLOCK_SIZE && local_kv_1 >= 0 && local_kv_1 < KV_BLOCK_SIZE) {
             int mask_offset_3 = partial_block_index * block_area + local_q_1 * KV_BLOCK_SIZE + local_kv_1;
@@ -361,13 +363,41 @@ omni_attn_shared_kv(
     fill_2D_regs<float, kWarpTileSeqLenQ, 2>(lane_row_sum_new, 0.0f);
 
     static_assert(kWarpTileSeqLenQ == 1);
-    // Row max reduction
+    // Row max reduction - properly exclude masked values (-INFINITY)
+    // CRITICAL: Use stable max computation similar to naive kernel
+    // The naive kernel computes max from float32 values, so we need to be careful
+    // about precision when converting from half to float
     {
+      const float MASKED_THRESHOLD = -1e8f;
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
         half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
-        float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1]));
-        float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3]));
+        // Convert to float using higher precision conversion
+        // Use __half2float which preserves as much precision as possible
+        float s0 = __half2float(t_hptr_S_0_1[0]);
+        float s1 = __half2float(t_hptr_S_0_1[1]);
+        float s2 = __half2float(t_hptr_S_0_1[2]);
+        float s3 = __half2float(t_hptr_S_0_1[3]);
+        
+        // Compute max excluding masked values (-INFINITY)
+        // Use stable max computation: only include valid (non-masked) values
+        // This matches the naive kernel's approach: max over all valid scores
+        float tmp_max_0 = -INFINITY;
+        if (s0 > MASKED_THRESHOLD) {
+          tmp_max_0 = (tmp_max_0 == -INFINITY) ? s0 : max(tmp_max_0, s0);
+        }
+        if (s1 > MASKED_THRESHOLD) {
+          tmp_max_0 = (tmp_max_0 == -INFINITY) ? s1 : max(tmp_max_0, s1);
+        }
+        
+        float tmp_max_1 = -INFINITY;
+        if (s2 > MASKED_THRESHOLD) {
+          tmp_max_1 = (tmp_max_1 == -INFINITY) ? s2 : max(tmp_max_1, s2);
+        }
+        if (s3 > MASKED_THRESHOLD) {
+          tmp_max_1 = (tmp_max_1 == -INFINITY) ? s3 : max(tmp_max_1, s3);
+        }
+        
         lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
         lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
       }
@@ -377,25 +407,107 @@ omni_attn_shared_kv(
 
     // Compute exp and row sum
     {
+      // CRITICAL: Merge max BEFORE computing exp to ensure numerical stability
+      // The global max should be computed first, then used for all exp computations
       float block_row_max_new_0 = lane_row_max_new[0][0];
       float block_row_max_new_1 = lane_row_max_new[0][1];
       float block_row_max_old_0 = lane_block_row_max_old[0][0];
       float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
-      float block_row_max_old_0_safe = (kv_idx > 0 ? block_row_max_old_0 : block_row_max_new_0);
-      float block_row_max_old_1_safe = (kv_idx > 0 ? block_row_max_old_1 : block_row_max_new_1);
+      
+      const float MASKED_THRESHOLD = -1e8f;
+      
+      // Compute global max: merge old and new max values
+      // Use old max if new max is invalid (all masked in current block)
+      if (block_row_max_new_0 > MASKED_THRESHOLD) {
+        if (block_row_max_old_0 > MASKED_THRESHOLD) {
+          block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
+        }
+        // else: first block, use new max
+      } else {
+        // Current block is all masked, keep old max
+        block_row_max_new_0 = (block_row_max_old_0 > MASKED_THRESHOLD) ? block_row_max_old_0 : block_row_max_new_0;
+      }
+      
+      if (block_row_max_new_1 > MASKED_THRESHOLD) {
+        if (block_row_max_old_1 > MASKED_THRESHOLD) {
+          block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
+        }
+      } else {
+        block_row_max_new_1 = (block_row_max_old_1 > MASKED_THRESHOLD) ? block_row_max_old_1 : block_row_max_new_1;
+      }
+      
+      // Handle case where max is -INFINITY (all values masked)
+      // If max is -INFINITY, all exp values should be 0, and we should skip exp computation
+      bool all_masked_0 = (block_row_max_new_0 <= MASKED_THRESHOLD);
+      bool all_masked_1 = (block_row_max_new_1 <= MASKED_THRESHOLD);
 
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
         half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
+        // P = Exp(S - m_new), where S is already scaled
+        // IMPORTANT: Handle -INFINITY values to avoid NaN when max is also -INFINITY
         float4 t_reg_S_0_1;
-        t_reg_S_0_1.x = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[0]), 1.0f, -block_row_max_new_0));
-        t_reg_S_0_1.y = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[1]), 1.0f, -block_row_max_new_0));
-        t_reg_S_0_1.z = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[2]), 1.0f, -block_row_max_new_1));
-        t_reg_S_0_1.w = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[3]), 1.0f, -block_row_max_new_1));
+        float s_val_0 = __half2float(t_hptr_S_0_1[0]);
+        float s_val_1 = __half2float(t_hptr_S_0_1[1]);
+        float s_val_2 = __half2float(t_hptr_S_0_1[2]);
+        float s_val_3 = __half2float(t_hptr_S_0_1[3]);
+        
+        // Check for -INFINITY to avoid NaN: exp(-INF - (-INF)) = exp(NaN) = NaN
+        // If score is -INFINITY or if all values in row are masked, exp value should be 0
+        // CRITICAL: Use fused multiply-add for better numerical stability: exp(s - m) computed in one step
+        if (all_masked_0) {
+          t_reg_S_0_1.x = 0.0f;
+          t_reg_S_0_1.y = 0.0f;
+        } else {
+          // For better numerical stability, clamp the exponent to avoid underflow/overflow
+          // exp(x) where x < -88 underflows to 0, x > 88 overflows
+          float exp_arg_0 = s_val_0 - block_row_max_new_0;
+          float exp_arg_1 = s_val_1 - block_row_max_new_0;
+          const float EXP_CLAMP_MIN = -88.0f;  // exp(-88) ≈ 0
+          const float EXP_CLAMP_MAX = 88.0f;   // exp(88) ≈ inf
+          
+          if (s_val_0 <= MASKED_THRESHOLD) {
+            t_reg_S_0_1.x = 0.0f;
+          } else {
+            exp_arg_0 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_0));
+            t_reg_S_0_1.x = __expf(exp_arg_0);
+          }
+          
+          if (s_val_1 <= MASKED_THRESHOLD) {
+            t_reg_S_0_1.y = 0.0f;
+          } else {
+            exp_arg_1 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_1));
+            t_reg_S_0_1.y = __expf(exp_arg_1);
+          }
+        }
+        
+        if (all_masked_1) {
+          t_reg_S_0_1.z = 0.0f;
+          t_reg_S_0_1.w = 0.0f;
+        } else {
+          float exp_arg_2 = s_val_2 - block_row_max_new_1;
+          float exp_arg_3 = s_val_3 - block_row_max_new_1;
+          const float EXP_CLAMP_MIN = -88.0f;
+          const float EXP_CLAMP_MAX = 88.0f;
+          
+          if (s_val_2 <= MASKED_THRESHOLD) {
+            t_reg_S_0_1.z = 0.0f;
+          } else {
+            exp_arg_2 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_2));
+            t_reg_S_0_1.z = __expf(exp_arg_2);
+          }
+          
+          if (s_val_3 <= MASKED_THRESHOLD) {
+            t_reg_S_0_1.w = 0.0f;
+          } else {
+            exp_arg_3 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_3));
+            t_reg_S_0_1.w = __expf(exp_arg_3);
+          }
+        }
+        
         lane_row_sum_new[0][0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
         lane_row_sum_new[0][1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
+        // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
         t_hptr_S_0_1[0] = __float2half_rn(t_reg_S_0_1.x);
         t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
         t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
@@ -403,6 +515,11 @@ omni_attn_shared_kv(
       }
       lane_row_sum_new[0][0] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][0]);
       lane_row_sum_new[0][1] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][1]);
+      
+      // Store the global max for use in rescaling section
+      // This ensures exp and rescaling use the exact same max value
+      lane_row_max_new[0][0] = block_row_max_new_0;
+      lane_row_max_new[0][1] = block_row_max_new_1;
     }
 
     // load V from gmem -> smem (already done if prefetched)
@@ -432,19 +549,40 @@ omni_attn_shared_kv(
     // rescale O with online softmax correction.
     static_assert(kWarpTileSeqLenP == 1);
     {
-      float block_row_max_new_0 = lane_row_max_new[0][0];
+      float block_row_max_new_0 = lane_row_max_new[0][0];s
       float block_row_max_new_1 = lane_row_max_new[0][1];
       float block_row_sum_new_0 = lane_row_sum_new[0][0];
       float block_row_sum_new_1 = lane_row_sum_new[0][1];
+
       float block_row_max_old_0 = lane_block_row_max_old[0][0];
       float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
-      block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
-      float block_row_max_old_0_safe = (kv_idx > 0 ? block_row_max_old_0 : block_row_max_new_0);
-      float block_row_max_old_1_safe = (kv_idx > 0 ? block_row_max_old_1 : block_row_max_new_1);
+      const float MASKED_THRESHOLD = -1e8f;
+      
+      // Avoid inf value while using m_old for rescaling O.
+      block_row_max_old_0 = (kv_idx > 0 ? block_row_max_old_0 : block_row_max_new_0);
+      block_row_max_old_1 = (kv_idx > 0 ? block_row_max_old_1 : block_row_max_new_1);
 
-      float rescale_o_factor_0 = __expf(block_row_max_old_0_safe - block_row_max_new_0);
-      float rescale_o_factor_1 = __expf(block_row_max_old_1_safe - block_row_max_new_1);
+      // rescale factor for O and l, exp(m_old - m_global)
+      float rescale_o_factor_0 = 1.0f;
+      float rescale_o_factor_1 = 1.0f;
+      
+      if (block_row_max_old_0 > MASKED_THRESHOLD && block_row_max_new_0 > MASKED_THRESHOLD) {
+        float max_diff_0 = block_row_max_old_0 - block_row_max_new_0;\
+        const float MIN_EXP_DIFF = 1e-5f;
+        if (max_diff_0 < -MIN_EXP_DIFF) {  // m_new > m_old (max increased)
+          max_diff_0 = fmaxf(-88.0f, fminf(88.0f, max_diff_0));
+          rescale_o_factor_0 = __expf(max_diff_0);
+        }
+      }
+      
+      if (block_row_max_old_1 > MASKED_THRESHOLD && block_row_max_new_1 > MASKED_THRESHOLD) {
+        float max_diff_1 = block_row_max_old_1 - block_row_max_new_1;
+        const float MIN_EXP_DIFF = 1e-5f;
+        if (max_diff_1 < -MIN_EXP_DIFF) {  // m_new > m_old
+          max_diff_1 = fmaxf(-88.0f, fminf(88.0f, max_diff_1));
+          rescale_o_factor_1 = __expf(max_diff_1);
+        }
+      }
 
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
@@ -467,6 +605,7 @@ omni_attn_shared_kv(
       // update statistics
       float block_row_sum_old_0 = lane_block_row_sum_old[0][0];
       float block_row_sum_old_1 = lane_block_row_sum_old[0][1];
+      // l_new = exp(m_old - m_new) * l_old + l_new
       lane_block_row_sum_old[0][0] = __fmaf_rn(rescale_o_factor_0, block_row_sum_old_0, block_row_sum_new_0);
       lane_block_row_sum_old[0][1] = __fmaf_rn(rescale_o_factor_1, block_row_sum_old_1, block_row_sum_new_1);
       lane_block_row_max_old[0][0] = block_row_max_new_0;
@@ -478,13 +617,45 @@ omni_attn_shared_kv(
   // Final rescale and write O to gmem
   static_assert(kWarpTileSeqLenP == 1);
   {
-    float rescale_factor_0 = __frcp_rn(lane_block_row_sum_old[0][0]);
-    float rescale_factor_1 = __frcp_rn(lane_block_row_sum_old[0][1]);
+    // Avoid division by zero: if row_sum is 0 or very small, output should be zeros (all masked)
+    constexpr float kMinRowSum = 1e-6f;
+    bool has_valid_sum_0 = (lane_block_row_sum_old[0][0] > kMinRowSum);
+    bool has_valid_sum_1 = (lane_block_row_sum_old[0][1] > kMinRowSum);
+    float rescale_factor_0 = has_valid_sum_0 ? __frcp_rn(lane_block_row_sum_old[0][0]) : 0.0f;
+    float rescale_factor_1 = has_valid_sum_1 ? __frcp_rn(lane_block_row_sum_old[0][1]) : 0.0f;
+    
+    // Debug: print row_max and row_sum for every 64 rows of batch[0], head[0]
+    // if (QKV_batch_id == 0 && QKV_head_id == 0 && lane_id == 0) {
+    //   // Compute the first row index processed by this warp (lane 0, row_pair_idx 0)
+    //   int q_base = Q_tile_id * Br;
+    //   int row0 = q_base + warp_QP * kMmaAtomM + 0;  // First row of this warp
+      
+    //   // Print for rows that are multiples of 64
+    //   if (row0 % 64 == 0 && row0 < QKV_seqlen_orig) {
+    //     // Get the final max and sum values for the first row pair of this warp
+    //     // lane_block_row_max_old[0][0] and [0][1] are per-lane values for row pairs
+    //     // For lane 0, these correspond to the first row pair (rows row0 and row0+1)
+    //     float final_row_max_0 = lane_block_row_max_old[0][0];
+    //     float final_row_sum_0 = lane_block_row_sum_old[0][0];
+    //     printf("[omni_attn_shared_kv] batch[0] head[0] row[%d]: row_max=%.8f, row_sum=%.8f\n", 
+    //            row0, final_row_max_0, final_row_sum_0);
+        
+    //     // Also print row0+1 if it's also a multiple of 64
+    //     if ((row0 + 1) % 64 == 0 && (row0 + 1) < QKV_seqlen_orig) {
+    //       float final_row_max_1 = lane_block_row_max_old[0][1];
+    //       float final_row_sum_1 = lane_block_row_sum_old[0][1];
+    //       printf("[omni_attn_shared_kv] batch[0] head[0] row[%d]: row_max=%.8f, row_sum=%.8f\n", 
+    //              row0 + 1, final_row_max_1, final_row_sum_1);
+    //     }
+    //   }
+    // }
+
     #pragma unroll
     for (int j = 0; j < kWarpTileHeadDimV; ++j) {
       if constexpr (kOStorageAccFloat32) {
         float *t_fptr_D_0_1 = reinterpret_cast<float *>(&(R_D[0][j][0]));
         half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
+        // O_output(D) = ( 1/sum_exp ) * O_final (FA2 paper)
         t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[0]);
         t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[1]);
         t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[2]);
@@ -496,37 +667,35 @@ omni_attn_shared_kv(
         t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
         t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
       }
+    }
+  }
 
-      // Write to global memory - simple per-thread write based on MMA layout
-      // Each thread holds 2 rows: row_0 = lane_id % 8, row_1 = row_0 + 8
-      // Each thread holds 2 cols per row: col_pair = (lane_id / 8) * 2
-      int row_in_tile = lane_id % 8;
-      int row0 = Q_tile_id * Br + warp_QP * kMmaAtomM + row_in_tile;
-      int row1 = row0 + 8;
-      int col_pair = (lane_id / 8) * 2;
-      int col0 = j * kMmaAtomN + col_pair;
-      int col1 = col0 + 1;
-      half *D = reinterpret_cast<half *>(&(R_D[0][j][0]));
-      
-      if (row0 < QKV_seqlen) {
-        if (col0 < kHeadDim) {
-          int addr = O_gmem_offset + row0 * kHeadDim + col0;
-          O[addr] = D[0];
-        }
-        if (col1 < kHeadDim) {
-          int addr = O_gmem_offset + row0 * kHeadDim + col1;
-          O[addr] = D[1];
-        }
-      }
-      if (row1 < QKV_seqlen) {
-        if (col0 < kHeadDim) {
-          int addr = O_gmem_offset + row1 * kHeadDim + col0;
-          O[addr] = D[2];
-        }
-        if (col1 < kHeadDim) {
-          int addr = O_gmem_offset + row1 * kHeadDim + col1;
-          O[addr] = D[3];
-        }
+  // Store O(D): Write O[Br,d] from regs -> gmem, collective store
+  // with reg reuse & warp shuffle. may need R_Z[2][4].
+  static_assert(kWarpTileSeqLenP == 1);
+  { // kWarpTileSeqLenP = 1
+    #pragma unroll
+    for (int j = 0; j < kWarpTileHeadDimV; ++j) { // 8
+      // we have to use new R_Z regs for collective store.
+      uint32_t R_Z[2][4];
+      R_Z[0][0] = R_D[0][j][0];
+      R_Z[1][0] = R_D[0][j][1]; // warp_size 4
+      R_Z[0][1] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 1, 4);
+      R_Z[0][2] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 2, 4);
+      R_Z[0][3] = __shfl_sync((0xffffffff), R_D[0][j][0], lane_id + 3, 4);
+      R_Z[1][1] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 1, 4);
+      R_Z[1][2] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 2, 4);
+      R_Z[1][3] = __shfl_sync((0xffffffff), R_D[0][j][1], lane_id + 3, 4);
+      if (lane_id % 4 == 0) {
+        int store_warp_regs_O_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenP) + 0 * kMmaAtomM;
+        int store_lane_gmem_O_Br = O_tile_id * Br + store_warp_regs_O_Br + lane_id / 4; // 0~7
+        // (0~3)*16 + (0/1)*8=(0,8,16,24,...,48,56)
+        int store_warp_regs_O_d = warp_KV * (kMmaAtomN * kWarpTileHeadDimV) + j * kMmaAtomN;
+        int store_lane_gmem_O_d = store_warp_regs_O_d; // (0~3)*16+(0/8)
+        int store_gmem_O_addr_0 = (O_gmem_offset + (store_lane_gmem_O_Br + 0) * kHeadDim + store_lane_gmem_O_d);
+        int store_gmem_O_addr_1 = (O_gmem_offset + (store_lane_gmem_O_Br + 8) * kHeadDim + store_lane_gmem_O_d);
+        LDST128BITS(O[store_gmem_O_addr_0]) = LDST128BITS(R_Z[0][0]);
+        LDST128BITS(O[store_gmem_O_addr_1]) = LDST128BITS(R_Z[1][0]);
       }
     }
   }
@@ -614,10 +783,6 @@ void omni_attn_mma_stages_split_q_shared_kv(
         ". Supported values: 32, 64, 128");
   }
   
-  // Always use stage 1 (no prefetch, shared KV only)
-  // Prefetch support removed - would require double-buffering to avoid smem conflicts
-  constexpr int kStage = 1;
-  
   // Validate BLOCK_SIZE is supported (64 or 128)
   if (Q_BLOCK_SIZE != 64 && Q_BLOCK_SIZE != 128) {
     throw std::runtime_error(
@@ -664,7 +829,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
   constexpr int kPadQ = 0;
   constexpr int kPadK = 0;
   constexpr int kPadV = 0;
-  constexpr int kOStorageAccFloat32 = 0;
+  constexpr int kOStorageAccFloat32 = 1;
   
   // Launch kernel based on head_dim, BLOCK_SIZE, and stages
   if (Q_BLOCK_SIZE == 64 && KV_BLOCK_SIZE == 64) {
