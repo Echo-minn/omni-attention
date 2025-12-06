@@ -635,7 +635,6 @@ def omni_attention_mma(
             f"Please use --kv_block_size 64 or --kv_block_size 128."
         )
     
-    # TODO: Get partial mask information
     has_partial = (block_mask.partial_block_mask_indices is not None and 
                    block_mask.partial_block_masks is not None)
     partial_block_mask_indices = None
@@ -643,6 +642,8 @@ def omni_attention_mma(
     if has_partial:
         partial_block_mask_indices = block_mask.partial_block_mask_indices.contiguous().to(torch.int32)
         partial_block_masks = block_mask.partial_block_masks.contiguous().to(torch.bool)
+
+    # print(f"has_partial: {has_partial} {partial_block_mask_indices is not None} {partial_block_masks is not None}")
     
     # Call CUDA kernel
     omni_attn_mma_stages_split_q_shared_kv(
@@ -757,7 +758,9 @@ def omni_attention_simple(
     kv_num_blocks = block_mask.kv_num_blocks.contiguous().to(torch.int32)
     kv_indices = block_mask.kv_indices.contiguous().to(torch.int32)
     block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
-    has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
+    has_partial = ((block_mask_types == BlockMaskType.PARTIAL).any().item() and
+                   block_mask.partial_block_mask_indices is not None and
+                   block_mask.partial_block_masks is not None)
     
     B, H, num_q_blocks, max_blocks = block_mask_types.shape
     partial_offsets = torch.full(
@@ -1059,7 +1062,9 @@ def omni_attention_preftech(
     block_mask_types = block_mask.block_mask_types.contiguous().to(torch.int32)
 
     # Get partial mask information
-    has_partial = (block_mask_types == BlockMaskType.PARTIAL).any().item()
+    has_partial = ((block_mask_types == BlockMaskType.PARTIAL).any().item() and
+                   block_mask.partial_block_mask_indices is not None and
+                   block_mask.partial_block_masks is not None)
     
     B, H, num_q_blocks, max_blocks = block_mask_types.shape
     partial_offsets = torch.full(
@@ -1157,18 +1162,59 @@ def check_correctness(
         print(f"[{name}] Shape mismatch: {ref_output.shape} vs {test_output.shape}")
         return False
     
+    # Check for None or invalid outputs
+    if test_output is None:
+        print(f"[{name}] test_output is None")
+        return False
+    
     ref_output = ref_output.float()
     test_output = test_output.float()
     
-    max_diff = (ref_output - test_output).abs().max().item()
-    rel_diff = ((ref_output - test_output).abs() / (ref_output.abs() + 1e-8)).max().item()
+    # Check for NaN values in outputs
+    ref_nan_count = torch.isnan(ref_output).sum().item()
+    test_nan_count = torch.isnan(test_output).sum().item()
+    ref_inf_count = torch.isinf(ref_output).sum().item()
+    test_inf_count = torch.isinf(test_output).sum().item()
+    
+    # Check for uninitialized output (all zeros or all NaN)
+    test_zero_count = (test_output == 0).sum().item()
+    test_total = test_output.numel()
+    if test_zero_count == test_total:
+        print(f"[{name}] WARNING: test_output is all zeros (possibly uninitialized)")
+    elif test_nan_count == test_total:
+        print(f"[{name}] WARNING: test_output is all NaN (kernel may have failed)")
+    
+    if ref_nan_count > 0:
+        print(f"[{name}] WARNING: ref_output contains {ref_nan_count} NaN values")
+    if test_nan_count > 0:
+        print(f"[{name}] WARNING: test_output contains {test_nan_count} NaN values (out of {test_total}({test_nan_count/test_total:.2%}) total)")
+    if ref_inf_count > 0:
+        print(f"[{name}] WARNING: ref_output contains {ref_inf_count} Inf values")
+    if test_inf_count > 0:
+        print(f"[{name}] WARNING: test_output contains {test_inf_count} Inf values")
+    
+    # Compute differences (will be nan if either tensor has nan)
+    diff = (ref_output - test_output).abs()
+    max_diff = diff.max().item()
+    min_diff = diff.min().item()
+    mean_diff = diff.mean().item()
     
     passed = torch.allclose(ref_output, test_output, rtol=rtol, atol=atol)
     
+    # print max and min diff of some rows of batch[0, 0, ]
+    # for i in range(16):
+    #     rows_ref = ref_output[0, 0, i*64, :]
+    #     rows_test = test_output[0, 0, i*64, :]
+    #     rows_diff = (rows_ref - rows_test).abs()
+    #     rows_max_diff = rows_diff.max().item()
+    #     rows_min_diff = rows_diff.min().item()
+    #     rows_mean_diff = rows_diff.mean().item()
+    #     print(f"First {i*64} rows (batch[0], head[0]): max_diff={rows_max_diff:.6f}, min_diff={rows_min_diff:.6f}, mean_diff={rows_mean_diff:.6f}")
+
     if passed:
-        print(f"[{name}] PASSED (max_diff={max_diff:.6f}, rel_diff={rel_diff:.6f})")
+        print(f"[{name}] PASSED (max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}), min_diff={min_diff:.6f}")
     else:
-        print(f"[{name}] FAILED (max_diff={max_diff:.6f}, rel_diff={rel_diff:.6f})")
+        print(f"[{name}] FAILED (max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}), min_diff={min_diff:.6f}")
     
     return passed
 

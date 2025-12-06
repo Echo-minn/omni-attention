@@ -466,12 +466,10 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
     // <Prefetch K g2s>: load next K tile from gmem -> smem 0, before P@V.
     if constexpr (kCanPrefetchKVg2s) {
       if ((tile_K_seqlen + 1) < Tc) {
-        load_gmem_K_Bc_offset =
-            (tile_K_seqlen + 1) * Bc; // e.g (0~3)*64=(0,64,128,192,...)
+        load_gmem_K_Bc_offset = (tile_K_seqlen + 1) * Bc; // e.g (0~3)*64=(0,64,128,192,...)
         int load_gmem_K_Bc = load_gmem_K_Bc_offset + load_smem_K_Bc;
         int load_gmem_K_d = load_smem_K_d;
-        int load_gmem_K_addr =
-            (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
+        int load_gmem_K_addr = (K_gmem_offset + load_gmem_K_Bc * kHeadDim + load_gmem_K_d);
         uint32_t load_smem_K_ptr =
             (smem_K_base_ptr +
              (kPrefetchKg2sSmemId * K_tile_size +
@@ -520,10 +518,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         // 15       T28: {c2, c3}  T29: {c2, c3}  T30: {c2, c3}  T31: {c2, c3}
         half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
         // This should be the row max after S = (Q @ K^T) / sqrt(d)
-        float tmp_max_0 =
-            __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
-        float tmp_max_1 =
-            __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
+        float tmp_max_0 = __half2float(__hmax(t_hptr_S_0_1[0], t_hptr_S_0_1[1])) * scale;
+        float tmp_max_1 = __half2float(__hmax(t_hptr_S_0_1[2], t_hptr_S_0_1[3])) * scale;
         lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
         lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
       } // end for kWarpTileSeqLenK
@@ -531,10 +527,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       // Warp level reduce max, warp_size = 4
       // Each thread contains the maximum of 2 rows of Br,
       // and only the values of T0, T4, ..., T28 are used.
-      lane_row_max_new[0][0] =
-          warp_reduce_max<float, 4>(lane_row_max_new[0][0]);
-      lane_row_max_new[0][1] =
-          warp_reduce_max<float, 4>(lane_row_max_new[0][1]);
+      lane_row_max_new[0][0] = warp_reduce_max<float, 4>(lane_row_max_new[0][0]);
+      lane_row_max_new[0][1] = warp_reduce_max<float, 4>(lane_row_max_new[0][1]);
     } // end for kWarpTileSeqLenQ
 
     static_assert(kWarpTileSeqLenQ == 1);
@@ -557,14 +551,10 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
         // P = Exp(S - m_new), fmaf(x, y, z) = x * y + z;
         float4 t_reg_S_0_1;
-        t_reg_S_0_1.x = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[0]), scale,
-                                         -block_row_max_new_0));
-        t_reg_S_0_1.y = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[1]), scale,
-                                         -block_row_max_new_0));
-        t_reg_S_0_1.z = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[2]), scale,
-                                         -block_row_max_new_1));
-        t_reg_S_0_1.w = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[3]), scale,
-                                         -block_row_max_new_1));
+        t_reg_S_0_1.x = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[0]), scale, -block_row_max_new_0));
+        t_reg_S_0_1.y = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[1]), scale, -block_row_max_new_0));
+        t_reg_S_0_1.z = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[2]), scale, -block_row_max_new_1));
+        t_reg_S_0_1.w = __expf(__fmaf_rn(__half2float(t_hptr_S_0_1[3]), scale, -block_row_max_new_1));
         lane_row_sum_new[0][0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
         lane_row_sum_new[0][1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
@@ -575,10 +565,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       } // end for kWarpTileSeqLenK
 
       // Warp level reduce sum, warp_size = 4
-      lane_row_sum_new[0][0] =
-          warp_reduce_sum<float, 4>(lane_row_sum_new[0][0]);
-      lane_row_sum_new[0][1] =
-          warp_reduce_sum<float, 4>(lane_row_sum_new[0][1]);
+      lane_row_sum_new[0][0] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][0]);
+      lane_row_sum_new[0][1] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][1]);
     } // end for kWarpTileSeqLenQ = 1
 
     // Compute P[Br,Bc] @ V[Bc,d] = [Br,d] = [64, 64/128], partion Attention.
@@ -632,10 +620,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         int lane_smem_V_Bc = tile_V_Bc * kMmaAtomK + lane_id % 16; // 0~15; Bc, matmul K
         int lane_smem_V_d = warp_smem_V_d;        // 0
         uint32_t lane_smem_V_ptr =
-            (smem_V_base_ptr +
-             (kPrefetchVg2sSmemId * V_tile_size +
-              lane_smem_V_Bc * (kHeadDim + kPadV) + lane_smem_V_d) *
-                 sizeof(half));
+            (smem_V_base_ptr + (kPrefetchVg2sSmemId * V_tile_size +
+              lane_smem_V_Bc * (kHeadDim + kPadV) + lane_smem_V_d) * sizeof(half));
         LDMATRIX_X2_T(R_V[j][0], R_V[j][1], lane_smem_V_ptr); // R_V
       }
 
@@ -681,10 +667,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
       block_row_max_new_1 = max(block_row_max_old_1, block_row_max_new_1);
       // Avoid inf value while using m_old for rescaling O.
-      block_row_max_old_0 =
-          (tile_K_seqlen > 0 ? block_row_max_old_0 : block_row_max_new_0);
-      block_row_max_old_1 =
-          (tile_K_seqlen > 0 ? block_row_max_old_1 : block_row_max_new_1);
+      block_row_max_old_0 = (tile_K_seqlen > 0 ? block_row_max_old_0 : block_row_max_new_0);
+      block_row_max_old_1 = (tile_K_seqlen > 0 ? block_row_max_old_1 : block_row_max_new_1);
 
       // rescale factor for O and l, exp(m_old - m)
       float rescale_o_factor_0 =
@@ -705,28 +689,16 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         if constexpr (kOStorageAccFloat32) {
           // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
           float *t_fptr_D_0_1 = reinterpret_cast<float *>(&(R_D[0][j][0]));
-          t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[0],
-                                      __half2float(t_hptr_O_0_1[0]));
-          t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[1],
-                                      __half2float(t_hptr_O_0_1[1]));
-          t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[2],
-                                      __half2float(t_hptr_O_0_1[2]));
-          t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[3],
-                                      __half2float(t_hptr_O_0_1[3]));
+          t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[0], __half2float(t_hptr_O_0_1[0]));
+          t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[1], __half2float(t_hptr_O_0_1[1]));
+          t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[2], __half2float(t_hptr_O_0_1[2]));
+          t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[3], __half2float(t_hptr_O_0_1[3]));
         } else {
           half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-          t_hptr_D_0_1[0] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[0]),
-                        __half2float(t_hptr_O_0_1[0])));
-          t_hptr_D_0_1[1] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[1]),
-                        __half2float(t_hptr_O_0_1[1])));
-          t_hptr_D_0_1[2] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[2]),
-                        __half2float(t_hptr_O_0_1[2])));
-          t_hptr_D_0_1[3] = __float2half_rn(
-              __fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[3]),
-                        __half2float(t_hptr_O_0_1[3])));
+          t_hptr_D_0_1[0] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[0]), __half2float(t_hptr_O_0_1[0])));
+          t_hptr_D_0_1[1] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[1]), __half2float(t_hptr_O_0_1[1])));
+          t_hptr_D_0_1[2] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[2]), __half2float(t_hptr_O_0_1[2])));
+          t_hptr_D_0_1[3] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[3]), __half2float(t_hptr_O_0_1[3])));
         }
       } // end for kWarpTileHeadDimV.
 
@@ -736,10 +708,8 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
       float block_row_sum_old_0 = lane_block_row_sum_old[0][0];
       float block_row_sum_old_1 = lane_block_row_sum_old[0][1];
       // Update l = exp(m_old - m_new) * l_old + row_sum(P).
-      lane_block_row_sum_old[0][0] = (__fmaf_rn(
-          rescale_o_factor_0, block_row_sum_old_0, block_row_sum_new_0));
-      lane_block_row_sum_old[0][1] = (__fmaf_rn(
-          rescale_o_factor_1, block_row_sum_old_1, block_row_sum_new_1));
+      lane_block_row_sum_old[0][0] = (__fmaf_rn(rescale_o_factor_0, block_row_sum_old_0, block_row_sum_new_0));
+      lane_block_row_sum_old[0][1] = (__fmaf_rn(rescale_o_factor_1, block_row_sum_old_1, block_row_sum_new_1));
       // 2. Then, update block row max for each lane.
       lane_block_row_max_old[0][0] = block_row_max_new_0;
       lane_block_row_max_old[0][1] = block_row_max_new_1;
@@ -776,8 +746,7 @@ __global__ void __launch_bounds__(WARP_SIZE *kMmaTileSeqLenQ *kMmaTileSeqLenK)
         t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[3]);
       } else {
         half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-        t_hptr_D_0_1[0] =
-            __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[0]));
+        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[0]));
         t_hptr_D_0_1[1] =
             __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[1]));
         t_hptr_D_0_1[2] =

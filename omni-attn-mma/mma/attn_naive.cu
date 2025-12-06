@@ -289,6 +289,12 @@ __global__ void omni_attn_simple_kernel_impl(
 
   float inv_sum = 1.0f / sum_exp;
 
+  // Debug: print row_max and row_sum for every 64 rows of batch[0], head[0]
+  // if (batch_id == 0 && head_id == 0 && q_idx % 64 == 0) {
+  //   printf("[attn_naive] batch[0] head[0] row[%d]: row_max=%.8f, row_sum=%.8f\n", 
+  //          q_idx, max_score, sum_exp);
+  // }
+
   for (int d = 0; d < head_dim; ++d) {
     float final_val = out[d] * inv_sum;
     O[q_row_offset + d] = __float2half(final_val);

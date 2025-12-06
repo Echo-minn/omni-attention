@@ -164,7 +164,7 @@ def test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output):
         torch.cuda.synchronize()
         omni_time = time.time() - start
 
-        passed =check_correctness(
+        check_correctness(
             reference_output,
             omni_output,
             rtol=1e-1,
@@ -238,8 +238,8 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_block_size, device)
     omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
     # omni_output, omni_time = test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output)
-    omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
     # omni_output, omni_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)
+    omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
 
     # Compare omni vs flex
     if omni_output is not None:
@@ -256,8 +256,8 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
         )
         
         if omni_time and flex_time:
-            speedup = omni_time / flex_time
-            faster = "omni" if speedup < 1 else "flex"
+            speedup = flex_time / omni_time
+            faster = "omni" if speedup > 1 else "flex"
             print(f"  Speedup: {speedup:.2f}x ({faster} faster)")
             print(f"    omni: {omni_time*1000:.2f}ms")
             print(f"    flex: {flex_time*1000:.2f}ms")

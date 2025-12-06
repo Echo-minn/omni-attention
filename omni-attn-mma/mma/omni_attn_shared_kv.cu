@@ -120,8 +120,8 @@ omni_attn_shared_kv(
   uint32_t R_Q[kNumPrefetchQs2r][kWarpTileSeqLenQ][4]; // [1][1][4]
   uint32_t R_K[kWarpTileSeqLenK][2];                   // [8][2]
   uint32_t R_V[kWarpTileHeadDimV][2];
-  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][2];
-  uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][2]; // [1][8][2]
+  uint32_t R_S[kWarpTileSeqLenQ][kWarpTileSeqLenK][4]; // [1][8][4], acc f32.
+  uint32_t R_O[kWarpTileSeqLenP][kWarpTileHeadDimV][4]; // [1][8][4], acc f32.
   uint32_t R_D[kWarpTileSeqLenP][kWarpTileHeadDimV][(kOStorageAccFloat32) ? 4 : 2];
   fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV,((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
 
@@ -199,9 +199,14 @@ omni_attn_shared_kv(
     __syncthreads();
 
     // compute S = Q @ K^T with multiple MMA tiles(m16n8k16)
-    fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 2>(R_S, 0);
+    fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 4>(R_S, 0);
+    
     #pragma unroll
     for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
+      if (kv_idx == 0 && tile_K_d == 0 && lane_id < 1 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 0) {
+        int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + 0 * kMmaAtomM;
+        int actual_Q_row = Q_tile_id * Br + warp_smem_Q_Br + (lane_id % 16);
+      }
       // load Q from smem to registers (m16k16)
       #pragma unroll
       for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
@@ -220,118 +225,154 @@ omni_attn_shared_kv(
         int lane_smem_K_d = tile_K_d * kMmaAtomK + ((lane_id / 8) % 2) * 8;
         uint32_t lane_smem_K_ptr = (smem_K_base_ptr + (lane_smem_K_Bc * (kHeadDim + kPadK) + lane_smem_K_d) * sizeof(half));
         LDMATRIX_X2(R_K[j][0], R_K[j][1], lane_smem_K_ptr);
+        
+        // DEBUG: Print K column indices
+        if (tile_K_d == 0 && j == 0 && lane_id < 1 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 0 && kv_idx == 0) {
+          int actual_K_col = kv_block * KV_BLOCK_SIZE + lane_smem_K_Bc;
+        }
       }
 
       // MMA computation: R_S += R_Q @ R_K^T (m16n8k16)
+      // MMA always accumulate with F32 dtype for high precision.
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        HMMA16816(R_S[0][j][0], R_S[0][j][1], R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3], R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1]);
+        HMMA16816F32(R_S[0][j][0], R_S[0][j][1], R_S[0][j][2], R_S[0][j][3],
+                     R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3],
+                     R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1],
+                     R_S[0][j][2], R_S[0][j][3]);
       }
     }
     __syncthreads();
 
-    // Apply scale to scores FIRST (before masking, matching omni_attn_preftech.cu)
+    // apply scale before mask, scores = (Q @ K^T) / sqrt(d)
     #pragma unroll
     for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-      half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
-      S[0] = __hmul(S[0], __float2half(scale));
-      S[1] = __hmul(S[1], __float2half(scale));
-      S[2] = __hmul(S[2], __float2half(scale));
-      S[3] = __hmul(S[3], __float2half(scale));
+      float *S = reinterpret_cast<float *>(&(R_S[0][j][0]));
+      S[0] = S[0] * scale;
+      S[1] = S[1] * scale;
+      S[2] = S[2] * scale;
+      S[3] = S[3] * scale;
     }
 
-    // Apply causal mask if needed (AFTER scaling)
+    // Apply mask in fp32 (AFTER scaling)
+    // Use consistent indexing: q_block_start for both causal and partial masks
+    int q_block_start = q_block * Q_BLOCK_SIZE;  // Same as Q_tile_id * Br when Br == Q_BLOCK_SIZE
+    int kv_base = kv_block * KV_BLOCK_SIZE;
+    
+    // DEBUG: Print mask type to verify all types are being processed
+    // if (lane_id % 16 == 0 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 1 && kv_idx == 1) {
+    //   printf("[DEBUG MASK_TYPE] lane_id=%d kv_block=%d mask_type=%d (0=MASKED,1=CAUSAL,2=FULL,3=PARTIAL)\n",
+    //          lane_id, kv_block, mask_type);
+    // }
+    
+    // BLOCK_MASK_FULL: No masking needed, all positions are valid
+    // BLOCK_MASK_CAUSAL: Apply causal masking, q_idx >= kv_idx
+    // BLOCK_MASK_PARTIAL: Apply per-element masking
+    
     if (mask_type == BLOCK_MASK_CAUSAL) {
-      int q_base = Q_tile_id * Br;
-      int kv_base = kv_block * KV_BLOCK_SIZE;
-      
-      int row_in_warp = lane_id % 16;
-      int row_pair_idx = row_in_warp / 2;
-      int row0 = q_base + warp_QP * kMmaAtomM + row_pair_idx * 2;
-      int row1 = row0 + 1;
-      
+      // MMA fragment layout: R_S[0][j][0-3] = {c0, c1, c2, c3}
+      // For m16n8k16: match the Q loading calculation
+      // Each warp processes 16 rows: warp_QP * 16 + (lane_id % 16)
+      // Rows 0-7 within warp: S[0], S[1] are for columns col_pair and col_pair+1
+      // Rows 8-15 within warp: S[2], S[3] are for columns col_pair and col_pair+1
+      int row_in_warp = lane_id % 16;  // 0-15: row within the warp's 16-row group
+      int col_pair = (lane_id / 8) * 2;  // 0, 2, 4, 6 - first column of the pair
+
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+        int q_base = Q_tile_id * Br;
+        int kv_base = kv_block * KV_BLOCK_SIZE;
+        
+        int row_in_warp = lane_id % 16;
+        int row_pair = row_in_warp / 2;
+        int q_row0 = q_base + warp_QP * kMmaAtomM + row_pair * 2;
+        int q_row1 = q_row0 + 1;
+
         int col_in_tile = lane_id % 8;
         int col_pair = col_in_tile / 2;
-        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair * 2;
-        int kv_col_1 = kv_col_0 + 1;
         
-        half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
-        if (row0 < kv_col_0)     S[0] = __float2half(-INFINITY);
-        if (row0 < kv_col_1)     S[1] = __float2half(-INFINITY);
-        if (row1 < kv_col_0)     S[2] = __float2half(-INFINITY);
-        if (row1 < kv_col_1)     S[3] = __float2half(-INFINITY);
+        #pragma unroll
+        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+          int kv_col_0 = kv_base + j * kMmaAtomN + col_pair * 2;
+          int kv_col_1 = kv_col_0 + 1;
+          
+          float *S = reinterpret_cast<float *>(&(R_S[0][j][0]));
+          if (q_row0 < kv_col_0)     S[0] = -INFINITY;
+          if (q_row0 < kv_col_1)     S[1] = -INFINITY;
+          if (q_row1 < kv_col_0)     S[2] = -INFINITY;
+          if (q_row1 < kv_col_1)     S[3] = -INFINITY;
+        }
       }
     }
 
-    // Apply partial mask if needed (AFTER scaling, for PARTIAL blocks with valid partial mask data)
+    // Apply partial mask if needed
     if (mask_type == BLOCK_MASK_PARTIAL && has_partial_masks && partial_block_masks != nullptr && partial_block_index >= 0) {
-      int q_base = Q_tile_id * Br;
-      int kv_base = kv_block * KV_BLOCK_SIZE;
-      int q_block_start = q_block * Q_BLOCK_SIZE;
-      // Match Q loading pattern: row_in_warp = lane_id % 16
-      int row_in_warp = lane_id % 16;  // 0-15, matches lane_smem_Q_Br calculation
-      int row_pair_idx = row_in_warp / 2;  // 0,0,1,1,2,2,...,7,7
-      int row0 = q_base + warp_QP * kMmaAtomM + row_pair_idx * 2;
-      int row1 = row0 + 1;
-      // Column calculation: match K loading pattern (same as causal mask)
+      // Rows 0-7: S[0], S[1] are for columns col_pair and col_pair
+      // Rows 8-15: S[2], S[3] are for columns col_pair and col_pair+1
+      int row_in_warp = lane_id % 16;
+      int row_in_tile = lane_id % 8;  // 0-7 for rows within the 8-row group
+      int col_pair = (lane_id / 8) * 2;  // 0, 2, 4, 6 - first column of the pair
       const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
       
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        // Match K loading pattern (same as causal mask)
-        int col_in_tile = lane_id % 8;  // 0-7
-        int col_pair = col_in_tile / 2;  // 0,0,1,1,2,2,3,3 -> pairs (0,1), (2,3), (4,5), (6,7)
-        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair * 2;
+        int kv_col_0 = kv_base + j * kMmaAtomN + col_pair;
         int kv_col_1 = kv_col_0 + 1;
         
-        half *S = reinterpret_cast<half *>(&R_S[0][j][0]);
+        float *S = reinterpret_cast<float *>(&(R_S[0][j][0]));
         
-        // Check mask for (row0, kv_col_0)
-        if (row0 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
-          int local_q_0 = row0 - q_block_start;
-          int local_kv_0 = kv_col_0 - kv_base;
-          if (local_q_0 >= 0 && local_q_0 < Q_BLOCK_SIZE && local_kv_0 >= 0 && local_kv_0 < KV_BLOCK_SIZE) {
-            int mask_offset_0 = partial_block_index * block_area + local_q_0 * KV_BLOCK_SIZE + local_kv_0;
-            if (!partial_block_masks[mask_offset_0]) {
-              S[0] = __float2half(-INFINITY);
+        if (row_in_warp < 8) {
+          int actual_row = q_block_start + warp_QP * kMmaAtomM + row_in_tile;
+          
+          // Check mask for S[0] (kv_col_0)
+          if (actual_row < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
+            int local_q = actual_row - q_block_start;
+            int local_kv = kv_col_0 - kv_base;
+            if (local_q >= 0 && local_q < Q_BLOCK_SIZE && local_kv >= 0 && local_kv < KV_BLOCK_SIZE) {
+              int mask_offset_0 = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
+              if (!partial_block_masks[mask_offset_0]) {
+                S[0] = -INFINITY;
+              }
+            }
+          }
+          
+          // Check mask for S[1] (kv_col_1)
+          if (actual_row < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
+            int local_q = actual_row - q_block_start;
+            int local_kv = kv_col_1 - kv_base;
+            if (local_q >= 0 && local_q < Q_BLOCK_SIZE && local_kv >= 0 && local_kv < KV_BLOCK_SIZE) {
+              int mask_offset_1 = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
+              if (!partial_block_masks[mask_offset_1]) {
+                S[1] = -INFINITY;
+              }
             }
           }
         }
-        
-        // Check mask for (row0, kv_col_1)
-        if (row0 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
-          int local_q_0 = row0 - q_block_start;
-          int local_kv_1 = kv_col_1 - kv_base;
-          if (local_q_0 >= 0 && local_q_0 < Q_BLOCK_SIZE && local_kv_1 >= 0 && local_kv_1 < KV_BLOCK_SIZE) {
-            int mask_offset_1 = partial_block_index * block_area + local_q_0 * KV_BLOCK_SIZE + local_kv_1;
-            if (!partial_block_masks[mask_offset_1]) {
-              S[1] = __float2half(-INFINITY);
+        // S[2] and S[3] are for rows 8-15 (same row, c2 and c3 are adjacent columns)
+        if (row_in_warp >= 8) {
+          int actual_row = q_block_start + warp_QP * kMmaAtomM + row_in_tile + 8;
+          
+          // Check mask for S[2] (kv_col_0)
+          if (actual_row < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
+            int local_q = actual_row - q_block_start;
+            int local_kv = kv_col_0 - kv_base;
+            if (local_q >= 0 && local_q < Q_BLOCK_SIZE && local_kv >= 0 && local_kv < KV_BLOCK_SIZE) {
+              int mask_offset_2 = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
+              if (!partial_block_masks[mask_offset_2]) {
+                S[2] = -INFINITY;
+              }
             }
           }
-        }
-        
-        // Check mask for (row1, kv_col_0)
-        if (row1 < QKV_seqlen_orig && kv_col_0 < QKV_seqlen_orig) {
-          int local_q_1 = row1 - q_block_start;
-          int local_kv_0 = kv_col_0 - kv_base;
-          if (local_q_1 >= 0 && local_q_1 < Q_BLOCK_SIZE && local_kv_0 >= 0 && local_kv_0 < KV_BLOCK_SIZE) {
-            int mask_offset_2 = partial_block_index * block_area + local_q_1 * KV_BLOCK_SIZE + local_kv_0;
-            if (!partial_block_masks[mask_offset_2]) {
-              S[2] = __float2half(-INFINITY);
-            }
-          }
-        }
-        
-        // Check mask for (row1, kv_col_1)
-        if (row1 < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
-          int local_q_1 = row1 - q_block_start;
-          int local_kv_1 = kv_col_1 - kv_base;
-          if (local_q_1 >= 0 && local_q_1 < Q_BLOCK_SIZE && local_kv_1 >= 0 && local_kv_1 < KV_BLOCK_SIZE) {
-            int mask_offset_3 = partial_block_index * block_area + local_q_1 * KV_BLOCK_SIZE + local_kv_1;
-            if (!partial_block_masks[mask_offset_3]) {
-              S[3] = __float2half(-INFINITY);
+          
+          // Check mask for S[3] (kv_col_1)
+          if (actual_row < QKV_seqlen_orig && kv_col_1 < QKV_seqlen_orig) {
+            int local_q = actual_row - q_block_start;
+            int local_kv = kv_col_1 - kv_base;
+            if (local_q >= 0 && local_q < Q_BLOCK_SIZE && local_kv >= 0 && local_kv < KV_BLOCK_SIZE) {
+              int mask_offset_3 = partial_block_index * block_area + local_q * KV_BLOCK_SIZE + local_kv;
+              if (!partial_block_masks[mask_offset_3]) {
+                S[3] = -INFINITY;
+              }
             }
           }
         }
@@ -364,51 +405,22 @@ omni_attn_shared_kv(
 
     static_assert(kWarpTileSeqLenQ == 1);
     // Row max reduction - properly exclude masked values (-INFINITY)
-    // CRITICAL: Use stable max computation similar to naive kernel
-    // The naive kernel computes max from float32 values, so we need to be careful
-    // about precision when converting from half to float
     {
-      const float MASKED_THRESHOLD = -1e8f;
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
-        // Convert to float using higher precision conversion
-        // Use __half2float which preserves as much precision as possible
-        float s0 = __half2float(t_hptr_S_0_1[0]);
-        float s1 = __half2float(t_hptr_S_0_1[1]);
-        float s2 = __half2float(t_hptr_S_0_1[2]);
-        float s3 = __half2float(t_hptr_S_0_1[3]);
-        
-        // Compute max excluding masked values (-INFINITY)
-        // Use stable max computation: only include valid (non-masked) values
-        // This matches the naive kernel's approach: max over all valid scores
-        float tmp_max_0 = -INFINITY;
-        if (s0 > MASKED_THRESHOLD) {
-          tmp_max_0 = (tmp_max_0 == -INFINITY) ? s0 : max(tmp_max_0, s0);
-        }
-        if (s1 > MASKED_THRESHOLD) {
-          tmp_max_0 = (tmp_max_0 == -INFINITY) ? s1 : max(tmp_max_0, s1);
-        }
-        
-        float tmp_max_1 = -INFINITY;
-        if (s2 > MASKED_THRESHOLD) {
-          tmp_max_1 = (tmp_max_1 == -INFINITY) ? s2 : max(tmp_max_1, s2);
-        }
-        if (s3 > MASKED_THRESHOLD) {
-          tmp_max_1 = (tmp_max_1 == -INFINITY) ? s3 : max(tmp_max_1, s3);
-        }
-        
+        float *S = reinterpret_cast<float *>(&(R_S[0][j][0]));
+        float tmp_max_0 = max(S[0], S[1]);
+        float tmp_max_1 = max(S[2], S[3]);
         lane_row_max_new[0][0] = max(lane_row_max_new[0][0], tmp_max_0);
         lane_row_max_new[0][1] = max(lane_row_max_new[0][1], tmp_max_1);
       }
+      // Warp level reduce max, warp_size = 4
       lane_row_max_new[0][0] = warp_reduce_max<float, 4>(lane_row_max_new[0][0]);
       lane_row_max_new[0][1] = warp_reduce_max<float, 4>(lane_row_max_new[0][1]);
     }
 
     // Compute exp and row sum
     {
-      // CRITICAL: Merge max BEFORE computing exp to ensure numerical stability
-      // The global max should be computed first, then used for all exp computations
       float block_row_max_new_0 = lane_row_max_new[0][0];
       float block_row_max_new_1 = lane_row_max_new[0][1];
       float block_row_max_old_0 = lane_block_row_max_old[0][0];
@@ -416,8 +428,6 @@ omni_attn_shared_kv(
       
       const float MASKED_THRESHOLD = -1e8f;
       
-      // Compute global max: merge old and new max values
-      // Use old max if new max is invalid (all masked in current block)
       if (block_row_max_new_0 > MASKED_THRESHOLD) {
         if (block_row_max_old_0 > MASKED_THRESHOLD) {
           block_row_max_new_0 = max(block_row_max_old_0, block_row_max_new_0);
@@ -436,82 +446,26 @@ omni_attn_shared_kv(
         block_row_max_new_1 = (block_row_max_old_1 > MASKED_THRESHOLD) ? block_row_max_old_1 : block_row_max_new_1;
       }
       
-      // Handle case where max is -INFINITY (all values masked)
-      // If max is -INFINITY, all exp values should be 0, and we should skip exp computation
       bool all_masked_0 = (block_row_max_new_0 <= MASKED_THRESHOLD);
       bool all_masked_1 = (block_row_max_new_1 <= MASKED_THRESHOLD);
 
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        half *t_hptr_S_0_1 = reinterpret_cast<half *>(&(R_S[0][j][0]));
-        // P = Exp(S - m_new), where S is already scaled
-        // IMPORTANT: Handle -INFINITY values to avoid NaN when max is also -INFINITY
-        float4 t_reg_S_0_1;
-        float s_val_0 = __half2float(t_hptr_S_0_1[0]);
-        float s_val_1 = __half2float(t_hptr_S_0_1[1]);
-        float s_val_2 = __half2float(t_hptr_S_0_1[2]);
-        float s_val_3 = __half2float(t_hptr_S_0_1[3]);
-        
-        // Check for -INFINITY to avoid NaN: exp(-INF - (-INF)) = exp(NaN) = NaN
-        // If score is -INFINITY or if all values in row are masked, exp value should be 0
-        // CRITICAL: Use fused multiply-add for better numerical stability: exp(s - m) computed in one step
-        if (all_masked_0) {
-          t_reg_S_0_1.x = 0.0f;
-          t_reg_S_0_1.y = 0.0f;
-        } else {
-          // For better numerical stability, clamp the exponent to avoid underflow/overflow
-          // exp(x) where x < -88 underflows to 0, x > 88 overflows
-          float exp_arg_0 = s_val_0 - block_row_max_new_0;
-          float exp_arg_1 = s_val_1 - block_row_max_new_0;
-          const float EXP_CLAMP_MIN = -88.0f;  // exp(-88) ≈ 0
-          const float EXP_CLAMP_MAX = 88.0f;   // exp(88) ≈ inf
-          
-          if (s_val_0 <= MASKED_THRESHOLD) {
-            t_reg_S_0_1.x = 0.0f;
-          } else {
-            exp_arg_0 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_0));
-            t_reg_S_0_1.x = __expf(exp_arg_0);
-          }
-          
-          if (s_val_1 <= MASKED_THRESHOLD) {
-            t_reg_S_0_1.y = 0.0f;
-          } else {
-            exp_arg_1 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_1));
-            t_reg_S_0_1.y = __expf(exp_arg_1);
-          }
-        }
-        
-        if (all_masked_1) {
-          t_reg_S_0_1.z = 0.0f;
-          t_reg_S_0_1.w = 0.0f;
-        } else {
-          float exp_arg_2 = s_val_2 - block_row_max_new_1;
-          float exp_arg_3 = s_val_3 - block_row_max_new_1;
-          const float EXP_CLAMP_MIN = -88.0f;
-          const float EXP_CLAMP_MAX = 88.0f;
-          
-          if (s_val_2 <= MASKED_THRESHOLD) {
-            t_reg_S_0_1.z = 0.0f;
-          } else {
-            exp_arg_2 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_2));
-            t_reg_S_0_1.z = __expf(exp_arg_2);
-          }
-          
-          if (s_val_3 <= MASKED_THRESHOLD) {
-            t_reg_S_0_1.w = 0.0f;
-          } else {
-            exp_arg_3 = fmaxf(EXP_CLAMP_MIN, fminf(EXP_CLAMP_MAX, exp_arg_3));
-            t_reg_S_0_1.w = __expf(exp_arg_3);
-          }
-        }
-        
-        lane_row_sum_new[0][0] += (t_reg_S_0_1.x + t_reg_S_0_1.y);
-        lane_row_sum_new[0][1] += (t_reg_S_0_1.z + t_reg_S_0_1.w);
+        float *S = reinterpret_cast<float *>(&(R_S[0][j][0]));
+        half *h_S = reinterpret_cast<half *>(&(R_S[0][j][0]));
+        // P = Exp(S - m_new), where S is already scaled logits
+        S[0] = __expf(S[0] - block_row_max_new_0);
+        S[1] = __expf(S[1] - block_row_max_new_0);
+        S[2] = __expf(S[2] - block_row_max_new_1);
+        S[3] = __expf(S[3] - block_row_max_new_1);
+        lane_row_sum_new[0][0] += (S[0] + S[1]);
+        lane_row_sum_new[0][1] += (S[2] + S[3]);
         // Update R_S for P[Br,Bc] = Exp(S-m), point wise.
-        t_hptr_S_0_1[0] = __float2half_rn(t_reg_S_0_1.x);
-        t_hptr_S_0_1[1] = __float2half_rn(t_reg_S_0_1.y);
-        t_hptr_S_0_1[2] = __float2half_rn(t_reg_S_0_1.z);
-        t_hptr_S_0_1[3] = __float2half_rn(t_reg_S_0_1.w);
+        // Also convert F32 -> half for P@V MMA, reuse R_S as P.
+        h_S[0] = __float2half_rn(S[0]);
+        h_S[1] = __float2half_rn(S[1]);
+        h_S[2] = __float2half_rn(S[2]);
+        h_S[3] = __float2half_rn(S[3]);
       }
       lane_row_sum_new[0][0] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][0]);
       lane_row_sum_new[0][1] = warp_reduce_sum<float, 4>(lane_row_sum_new[0][1]);
@@ -525,7 +479,7 @@ omni_attn_shared_kv(
     // load V from gmem -> smem (already done if prefetched)
     // compute O = P @ V
     // compute with multiple MMA tiles(m16n8k16)
-    fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 2>(R_O, 0);
+    fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV, 4>(R_O, 0);
     #pragma unroll
     for (int tile_V_Bc = 0; tile_V_Bc < (Bc / kMmaAtomK); ++tile_V_Bc) {
       // load V from smem to registers (k16n8, transposed)
@@ -541,7 +495,11 @@ omni_attn_shared_kv(
       int w = tile_V_Bc * 2;
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-        HMMA16816(R_O[0][j][0], R_O[0][j][1], R_S[0][w][0], R_S[0][w][1], R_S[0][w + 1][0], R_S[0][w + 1][1], R_V[j][0], R_V[j][1], R_O[0][j][0], R_O[0][j][1]);
+        // MMA always accumulate with F32 dtype for high precision.
+        HMMA16816F32(R_O[0][j][0], R_O[0][j][1], R_O[0][j][2], R_O[0][j][3],
+                     R_S[0][w][0], R_S[0][w][1], R_S[0][w + 1][0],
+                     R_S[0][w + 1][1], R_V[j][0], R_V[j][1], R_O[0][j][0],
+                     R_O[0][j][1], R_O[0][j][2], R_O[0][j][3]);
       }
     }
     __syncthreads();
@@ -549,14 +507,14 @@ omni_attn_shared_kv(
     // rescale O with online softmax correction.
     static_assert(kWarpTileSeqLenP == 1);
     {
-      float block_row_max_new_0 = lane_row_max_new[0][0];s
+      float block_row_max_new_0 = lane_row_max_new[0][0];
       float block_row_max_new_1 = lane_row_max_new[0][1];
       float block_row_sum_new_0 = lane_row_sum_new[0][0];
       float block_row_sum_new_1 = lane_row_sum_new[0][1];
 
       float block_row_max_old_0 = lane_block_row_max_old[0][0];
       float block_row_max_old_1 = lane_block_row_max_old[0][1];
-      const float MASKED_THRESHOLD = -1e8f;
+      const float MASKED_THRESHOLD = -1e9f;
       
       // Avoid inf value while using m_old for rescaling O.
       block_row_max_old_0 = (kv_idx > 0 ? block_row_max_old_0 : block_row_max_new_0);
@@ -586,19 +544,21 @@ omni_attn_shared_kv(
 
       #pragma unroll
       for (int j = 0; j < kWarpTileHeadDimV; ++j) {
-        half *t_hptr_O_0_1 = reinterpret_cast<half *>(&(R_O[0][j][0]));
+        // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
+        float *O = reinterpret_cast<float *>(&(R_O[0][j][0]));
         if constexpr (kOStorageAccFloat32) {
-          float *t_fptr_D_0_1 = reinterpret_cast<float *>(&(R_D[0][j][0]));
-          t_fptr_D_0_1[0] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[0], __half2float(t_hptr_O_0_1[0]));
-          t_fptr_D_0_1[1] = __fmaf_rn(rescale_o_factor_0, t_fptr_D_0_1[1], __half2float(t_hptr_O_0_1[1]));
-          t_fptr_D_0_1[2] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[2], __half2float(t_hptr_O_0_1[2]));
-          t_fptr_D_0_1[3] = __fmaf_rn(rescale_o_factor_1, t_fptr_D_0_1[3], __half2float(t_hptr_O_0_1[3]));
+          // (x,y) 0~7->{c0, c1}, (z,w)->8~15 {c2, c3}
+          float *D = reinterpret_cast<float *>(&(R_D[0][j][0])); // kWarpTileSeqLenP=1
+          D[0] = __fmaf_rn(rescale_o_factor_0, D[0], O[0]);
+          D[1] = __fmaf_rn(rescale_o_factor_0, D[1], O[1]);
+          D[2] = __fmaf_rn(rescale_o_factor_1, D[2], O[2]);
+          D[3] = __fmaf_rn(rescale_o_factor_1, D[3], O[3]);
         } else {
-          half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-          t_hptr_D_0_1[0] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[0]), __half2float(t_hptr_O_0_1[0])));
-          t_hptr_D_0_1[1] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, __half2float(t_hptr_D_0_1[1]), __half2float(t_hptr_O_0_1[1])));
-          t_hptr_D_0_1[2] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[2]), __half2float(t_hptr_O_0_1[2])));
-          t_hptr_D_0_1[3] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, __half2float(t_hptr_D_0_1[3]), __half2float(t_hptr_O_0_1[3])));
+          half *D_half = reinterpret_cast<half *>(&(R_D[0][j][0])); // kWarpTileSeqLenP=1
+          D_half[0] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, __half2float(D_half[0]), O[0]));
+          D_half[1] = __float2half_rn(__fmaf_rn(rescale_o_factor_0, __half2float(D_half[1]), O[1]));
+          D_half[2] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, __half2float(D_half[2]), O[2]));
+          D_half[3] = __float2half_rn(__fmaf_rn(rescale_o_factor_1, __half2float(D_half[3]), O[3]));
         }
       }
 
@@ -653,19 +613,19 @@ omni_attn_shared_kv(
     #pragma unroll
     for (int j = 0; j < kWarpTileHeadDimV; ++j) {
       if constexpr (kOStorageAccFloat32) {
-        float *t_fptr_D_0_1 = reinterpret_cast<float *>(&(R_D[0][j][0]));
-        half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
+        float *D = reinterpret_cast<float *>(&(R_D[0][j][0]));
+        half *D_half = reinterpret_cast<half *>(&(R_D[0][j][0]));
         // O_output(D) = ( 1/sum_exp ) * O_final (FA2 paper)
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[0]);
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * t_fptr_D_0_1[1]);
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[2]);
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * t_fptr_D_0_1[3]);
+        D_half[0] = __float2half_rn(rescale_factor_0 * D[0]);
+        D_half[1] = __float2half_rn(rescale_factor_0 * D[1]);
+        D_half[2] = __float2half_rn(rescale_factor_1 * D[2]);
+        D_half[3] = __float2half_rn(rescale_factor_1 * D[3]);
       } else {
-        half *t_hptr_D_0_1 = reinterpret_cast<half *>(&(R_D[0][j][0]));
-        t_hptr_D_0_1[0] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[0]));
-        t_hptr_D_0_1[1] = __float2half_rn(rescale_factor_0 * __half2float(t_hptr_D_0_1[1]));
-        t_hptr_D_0_1[2] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[2]));
-        t_hptr_D_0_1[3] = __float2half_rn(rescale_factor_1 * __half2float(t_hptr_D_0_1[3]));
+        half *D_half = reinterpret_cast<half *>(&(R_D[0][j][0]));
+        D_half[0] = __float2half_rn(rescale_factor_0 * __half2float(D_half[0]));
+        D_half[1] = __float2half_rn(rescale_factor_0 * __half2float(D_half[1]));
+        D_half[2] = __float2half_rn(rescale_factor_1 * __half2float(D_half[2]));
+        D_half[3] = __float2half_rn(rescale_factor_1 * __half2float(D_half[3]));
       }
     }
   }
