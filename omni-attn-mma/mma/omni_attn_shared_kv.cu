@@ -265,18 +265,9 @@ omni_attn_shared_kv(
     //          lane_id, kv_block, mask_type);
     // }
     
-    // BLOCK_MASK_FULL: No masking needed, all positions are valid
-    // BLOCK_MASK_CAUSAL: Apply causal masking, q_idx >= kv_idx
-    // BLOCK_MASK_PARTIAL: Apply per-element masking
-    
     if (mask_type == BLOCK_MASK_CAUSAL) {
-      // MMA fragment layout: R_S[0][j][0-3] = {c0, c1, c2, c3}
-      // For m16n8k16: match the Q loading calculation
-      // Each warp processes 16 rows: warp_QP * 16 + (lane_id % 16)
-      // Rows 0-7 within warp: S[0], S[1] are for columns col_pair and col_pair+1
-      // Rows 8-15 within warp: S[2], S[3] are for columns col_pair and col_pair+1
-      int row_in_warp = lane_id % 16;  // 0-15: row within the warp's 16-row group
-      int col_pair = (lane_id / 8) * 2;  // 0, 2, 4, 6 - first column of the pair
+      int row_in_warp = lane_id % 16;
+      int col_pair = (lane_id / 8) * 2;
 
       #pragma unroll
       for (int j = 0; j < kWarpTileSeqLenK; ++j) {
@@ -708,7 +699,7 @@ omni_attn_shared_kv(
 void omni_attn_mma_stages_split_q_shared_kv(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, torch::Tensor O,
     torch::Tensor kv_num_blocks, torch::Tensor kv_indices,
-    torch::Tensor block_mask_types, int stages, int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
+    torch::Tensor block_mask_types, int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     int seqlen_orig,
     torch::Tensor partial_block_mask_indices, torch::Tensor partial_block_masks,
     bool has_partial) {
@@ -791,7 +782,7 @@ void omni_attn_mma_stages_split_q_shared_kv(
   constexpr int kPadV = 0;
   constexpr int kOStorageAccFloat32 = 1;
   
-  // Launch kernel based on head_dim, BLOCK_SIZE, and stages
+  // Launch kernel based on head_dim, BLOCK_SIZE
   if (Q_BLOCK_SIZE == 64 && KV_BLOCK_SIZE == 64) {
     // BLOCK_SIZE=64 configuration
     constexpr int kMmaTileSeqLenQ = 4;  // Br = 16*4*1 = 64

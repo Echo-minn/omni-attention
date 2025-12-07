@@ -10,9 +10,10 @@ import sys
 import os
 import time
 from omni_attn_torch import (
+    omni_attention_shared_kv_swizzle,
     omni_attention_simple,
     omni_attention_cp_async,
-    omni_attention_mma,
+    omni_attention_shared_kv,
     omni_attention_preftech,
     check_correctness,
 )
@@ -60,7 +61,7 @@ def test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_
             torch.cuda.synchronize()
             flex_time = time.time() - start
             
-            check_correctness(
+            passed = check_correctness(
                 reference_output,
                 flex_output,
                 rtol=1e-1,
@@ -78,7 +79,7 @@ def test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_
     elif dense_mask is None:
         print("\nSkipping flex_attention (dense_mask not in debug data)")
 
-    return flex_output, flex_time
+    return passed, flex_output, flex_time
 
 def test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output):
     """Test omni_attention_simple with fixed debug data."""
@@ -98,7 +99,7 @@ def test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output):
         torch.cuda.synchronize()
         omni_time = time.time() - start
         
-        check_correctness(
+        passed = check_correctness(
             reference_output,
             omni_output,
             rtol=1e-1,
@@ -112,7 +113,7 @@ def test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output):
         import traceback
         traceback.print_exc()
       
-    return omni_output, omni_time
+    return passed, omni_output, omni_time
 
 def test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output):
     """Test omni_attention_cp_async with fixed debug data."""
@@ -156,15 +157,15 @@ def test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output):
     omni_output = None
     omni_time = None
     try:
-        _ = omni_attention_mma(Q, K, V, omni_block_mask)
+        _ = omni_attention_shared_kv(Q, K, V, omni_block_mask)
         torch.cuda.synchronize()
         
         start = time.time()
-        omni_output = omni_attention_mma(Q, K, V, omni_block_mask)
+        omni_output = omni_attention_shared_kv(Q, K, V, omni_block_mask)
         torch.cuda.synchronize()
         omni_time = time.time() - start
 
-        check_correctness(
+        passed = check_correctness(
             reference_output,
             omni_output,
             rtol=1e-1,
@@ -179,7 +180,41 @@ def test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output):
         import traceback
         traceback.print_exc()
       
-    return omni_output, omni_time
+    return passed, omni_output, omni_time
+
+def test_omni_attention_shared_kv_swizzle(Q, K, V, omni_block_mask, reference_output):
+
+    print("\n" + "="*60)
+    print("Testing omni_attention_shared_kv_swizzle...")
+    print("="*60)
+    
+    omni_output = None
+    omni_time = None
+
+    try:
+        _ = omni_attention_shared_kv_swizzle(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        
+        start = time.time()
+        omni_output = omni_attention_shared_kv_swizzle(Q, K, V, omni_block_mask)
+        torch.cuda.synchronize()
+        omni_time = time.time() - start
+
+        passed = check_correctness(
+            reference_output,
+            omni_output,
+            rtol=1e-1,
+            atol=1e-2,
+            name="omni_attention_shared_kv_swizzle"
+        )
+        print(f"  Time: {omni_time*1000:.2f}ms")
+        
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+      
+    return passed, omni_output, omni_time
 
 def test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output):
     """Test omni_attention_preftech with fixed debug data."""
@@ -198,7 +233,7 @@ def test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output):
         torch.cuda.synchronize()
         omni_time = time.time() - start
         
-        check_correctness(
+        passed = check_correctness(
             reference_output,
             omni_output,
             rtol=1e-1,
@@ -212,7 +247,7 @@ def test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output):
         import traceback
         traceback.print_exc()
       
-    return omni_output, omni_time
+    return passed, omni_output, omni_time
 
 def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     """Test kernels with fixed debug data."""
@@ -235,34 +270,29 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     print(f"  Q shape: {Q.shape}, dtype: {Q.dtype}; Q_BLOCK_SIZE: {q_block_size}, KV_BLOCK_SIZE: {kv_block_size}")
     print(f"  Reference output shape: {reference_output.shape}")
     
-    flex_output, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_block_size, device)
-    omni_output, omni_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
+    simple_passed, _, simple_time = test_omni_attention_simple(Q, K, V, omni_block_mask, reference_output)
     # omni_output, omni_time = test_omni_attention_cp_async(Q, K, V, omni_block_mask, reference_output)
-    # omni_output, omni_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)
-    omni_output, omni_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
+    prefetch_passed, _, preftech_time = test_omni_attention_preftech(Q, K, V, omni_block_mask, reference_output)
+    shared_kv_passed, _, shared_kv_time = test_omni_attention_shared_kv(Q, K, V, omni_block_mask, reference_output)
+    swizzle_passed, _, swizzle_time = test_omni_attention_shared_kv_swizzle(Q, K, V, omni_block_mask, reference_output)
+    flex_passed, _, flex_time = test_flex_attention(Q, K, V, dense_mask, reference_output, q_block_size, kv_block_size, device)
 
-    # Compare omni vs flex
-    if omni_output is not None:
-        print("\n" + "="*60)
-        print("Comparing omni_attention_simple vs flex_attention...")
-        print("="*60)
-        
-        check_correctness(
-            omni_output,
-            flex_output,
-            rtol=1e-1,
-            atol=1e-2,
-            name="omni vs flex"
-        )
-        
-        if omni_time and flex_time:
-            speedup = flex_time / omni_time
-            faster = "omni" if speedup > 1 else "flex"
-            print(f"  Speedup: {speedup:.2f}x ({faster} faster)")
-            print(f"    omni: {omni_time*1000:.2f}ms")
-            print(f"    flex: {flex_time*1000:.2f}ms")
-        
 
+    simple_speedup = flex_time / simple_time
+    prefetch_speedup = flex_time / preftech_time
+    shared_kv_speedup = flex_time / shared_kv_time
+    swizzle_speedup = flex_time / swizzle_time
+
+    print("\n" + "="*40)
+    print(f"Testing with data: {debug_data_file} ...")
+    print("="*40)
+
+    print(f"  Simple {'PASSED✅' if simple_passed else 'FAILED❌'}, time: {simple_time*1000:.2f}ms, speedup: {simple_speedup:.2f}x")
+    print(f"  Prefetch {'PASSED✅' if prefetch_passed else 'FAILED❌'}, time: {preftech_time*1000:.2f}ms, speedup: {prefetch_speedup:.2f}x")
+    print(f"  Shared_kv {'PASSED✅' if shared_kv_passed else 'FAILED❌'}, time: {shared_kv_time*1000:.2f}ms, speedup: {shared_kv_speedup:.2f}x")
+    print(f"  Swizzle {'PASSED✅' if swizzle_passed else 'FAILED❌'}, time: {swizzle_time*1000:.2f}ms, speedup: {swizzle_speedup:.2f}x")
+    print(f"  Flex {'PASSED✅' if flex_passed else 'FAILED❌'}, time: {flex_time*1000:.2f}ms")
+        
 if __name__ == "__main__":
     import argparse
     

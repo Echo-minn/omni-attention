@@ -23,7 +23,7 @@ from omni_attn_torch import (
     pad_modalities_to_block_size,
     print_block_structure,
     check_correctness,
-    omni_attention_mma,
+    omni_attention_shared_kv,
     omni_block_mask_from_flex_block_mask,
 )
 
@@ -321,9 +321,9 @@ def main():
         #     traceback.print_exc()
         
         # Test 3: MMA kernel (for comparison)
-        print("\n  Testing omni_attention_mma (MMA optimized)...")
+        print("\n  Testing omni_attention_shared_kv (MMA optimized)...")
         try:
-            from omni_attn_torch import omni_attention_mma
+            from omni_attn_torch import omni_attention_shared_kv
             
             # Create fresh copies of input tensors to avoid memory corruption
             Q_mma = Q_cuda.clone()
@@ -331,7 +331,7 @@ def main():
             V_mma = V_cuda.clone()
             
             # Warmup
-            _ = omni_attention_mma(Q_mma, K_mma, V_mma, omni_block_mask, stages=2)
+            _ = omni_attention_shared_kv(Q_mma, K_mma, V_mma, omni_block_mask, stages=2)
             torch.cuda.synchronize()  # This will raise if there's a CUDA error
             
             # Time the kernel
@@ -340,7 +340,7 @@ def main():
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             
-            mma_output = omni_attention_mma(Q_mma, K_mma, V_mma, omni_block_mask, stages=2)
+            mma_output = omni_attention_shared_kv(Q_mma, K_mma, V_mma, omni_block_mask, stages=2)
             
             end.record()
             torch.cuda.synchronize()  # This will raise if there's a CUDA error
@@ -354,7 +354,7 @@ def main():
                 mma_output, 
                 rtol=1e-1,  # More relaxed tolerance for half precision
                 atol=1e-2, 
-                name="omni_attention_mma"
+                name="omni_attention_shared_kv"
             )
             print(f"    ✓ MMA kernel time: {mma_time:.2f} ms")
             

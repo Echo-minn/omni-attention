@@ -48,7 +48,6 @@ void omni_attn_mma_stages_split_q_shared_kv(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor kv_num_blocks,
                                              torch::Tensor kv_indices,
                                              torch::Tensor block_mask_types,
-                                             int stages,
                                              int Q_BLOCK_SIZE,
                                              int KV_BLOCK_SIZE,
                                              int seqlen_orig,
@@ -56,11 +55,17 @@ void omni_attn_mma_stages_split_q_shared_kv(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor partial_block_masks,
                                              bool has_partial);
 
-void omni_attn_swizzle_kernel(torch::Tensor Q, torch::Tensor K,
+void omni_attn_mma_stages_split_q_shared_kv_swizzle(torch::Tensor Q, torch::Tensor K,
                                              torch::Tensor V, torch::Tensor O,
                                              torch::Tensor kv_num_blocks,
                                              torch::Tensor kv_indices,
-                                             torch::Tensor block_mask_types);
+                                             torch::Tensor block_mask_types,
+                                             int Q_BLOCK_SIZE,
+                                             int KV_BLOCK_SIZE,
+                                             int seqlen_orig,
+                                             torch::Tensor partial_block_mask_indices,
+                                             torch::Tensor partial_block_masks,
+                                             bool has_partial);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Basic
@@ -68,5 +73,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   TORCH_BINDING_COMMON_EXTENSION(omni_attn_simple_kernel)
   TORCH_BINDING_COMMON_EXTENSION(omni_attn_cp_async)
   TORCH_BINDING_COMMON_EXTENSION(omni_attn_preftech_kernel)
-  TORCH_BINDING_COMMON_EXTENSION(omni_attn_swizzle_kernel)
+  TORCH_BINDING_COMMON_EXTENSION(omni_attn_mma_stages_split_q_shared_kv_swizzle)
 }
