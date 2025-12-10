@@ -259,12 +259,6 @@ omni_attn_shared_kv(
     int q_block_start = q_block * Q_BLOCK_SIZE;  // Same as Q_tile_id * Br when Br == Q_BLOCK_SIZE
     int kv_base = kv_block * KV_BLOCK_SIZE;
     
-    // DEBUG: Print mask type to verify all types are being processed
-    // if (lane_id % 16 == 0 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 1 && kv_idx == 1) {
-    //   printf("[DEBUG MASK_TYPE] lane_id=%d kv_block=%d mask_type=%d (0=MASKED,1=CAUSAL,2=FULL,3=PARTIAL)\n",
-    //          lane_id, kv_block, mask_type);
-    // }
-    
     if (mask_type == BLOCK_MASK_CAUSAL) {
       int row_in_warp = lane_id % 16;
       int col_pair = (lane_id / 8) * 2;
@@ -803,6 +797,12 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -828,6 +828,12 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -853,6 +859,12 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -894,6 +906,12 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -919,6 +937,12 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -944,6 +968,12 @@ void omni_attn_mma_stages_split_q_shared_kv(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                           kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_shared_kv<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,

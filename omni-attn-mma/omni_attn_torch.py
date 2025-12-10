@@ -369,6 +369,10 @@ def naive_attention_with_dense_mask(
     if scale is None:
         scale = 1.0 / math.sqrt(D)
     
+    # Clear CUDA cache before large matmul operations to avoid allocation failures
+    if query.is_cuda:
+        torch.cuda.empty_cache()
+    
     # Compute attention scores
     scores = torch.matmul(query, key.transpose(-2, -1)) * scale
     

@@ -1,4 +1,4 @@
-# **Fine-grained FlashAttention with interleaved masking for Cross-Modal Data Training Efficiency**
+# **OmniAttention with interleaved masking for Cross-Modal Data Training Efficiency**
 
 > Mira Xiao(minxiao@andrew.cmu.edu)
 >

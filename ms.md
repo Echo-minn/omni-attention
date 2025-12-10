@@ -13,7 +13,15 @@ First I setup the cuda kernel building environment and make sure it can be bind 
 For the time being, with the designed input format, I have finished the attention cuda kernel with randomly generated interleaved masking and applied the q-tiling strategy/copy async/MMA to the omni attention kernel, and working on debugging with the shared KV memory buffer optimization. For the last mile of the project, I will apply the double buffering to prefetch kv and overlap compute and memory, which may have more memory overhead but can improve the throughput, and layout swizzling to the omni attention kernel.
 
 ## Preliminary results
-
+For the time being, We have finished the correctness and performance verification scripts for the omni attention kernel, and implemented the shared KV memory buffer optimization, which gets 1.05x speedup over the flex attention on sequence length 1024. The results are as follows:
+```shell
+============================================================
+Testing with data: data/1024/debug_data_F_C.pt ...
+============================================================
+Simple PASSED, time: 22.43ms, TFLOPS: 0.10, speedup: 0.01x
+Shared_kv PASSED, time: 0.25ms, TFLOPS: 8.73, speedup: 1.05x
+FlexAttention PASSED, time: 0.26ms, TFLOPS: 8.34
+```
 
 ## Issues & Concerns
 

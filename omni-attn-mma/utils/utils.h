@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <vector>
@@ -28,6 +29,23 @@ using namespace nvcuda;
 #define LDST32BITS(value) (reinterpret_cast<half2 *>(&(value))[0])
 #define LDST64BITS(value) (reinterpret_cast<float2 *>(&(value))[0])
 #define LDST128BITS(value) (reinterpret_cast<float4 *>(&(value))[0])
+
+// Helper: try to raise dynamic shared memory limit for a kernel launch.
+inline void set_kernel_max_dynamic_smem(const void *func, int smem_bytes) {
+  // Request larger dynamic smem; ignore if the architecture does not support it.
+  cudaError_t err =
+      cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  if (err != cudaSuccess && err != cudaErrorNotSupported) {
+    throw std::runtime_error(
+        "cudaFuncSetAttribute failed: " + std::string(cudaGetErrorString(err)));
+  }
+  // Prefer shared memory to maximize SMEM availability.
+  err = cudaFuncSetCacheConfig(func, cudaFuncCachePreferShared);
+  if (err != cudaSuccess && err != cudaErrorInvalidValue) {
+    throw std::runtime_error(
+        "cudaFuncSetCacheConfig failed: " + std::string(cudaGetErrorString(err)));
+  }
+}
 // gmem -> smem
 #define CP_ASYNC_COMMIT_GROUP() asm volatile("cp.async.commit_group;\n" ::)
 #define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)

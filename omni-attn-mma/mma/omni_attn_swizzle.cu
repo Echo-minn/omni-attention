@@ -41,27 +41,21 @@ static __device__ __forceinline__ int swizzle_permuted_V_j(int i, int j) {
 }
 
 template <
-  const int kHeadDim,          // Headdim, 32,64,128
-  const int kMmaAtomM,         // MMA Atom M, 16
-  const int kMmaAtomN,         // MMA Atom N, 8
-  const int kMmaAtomK,         // MMA Atom K, 16
-  const int kMmaTileSeqLenQ,   // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M),
-                                // d(K)]@[d(K),  Bc(N)]
-  const int kMmaTileSeqLenK,   // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M),
-                                // d(K)]@[d(K),  Bc(N)]
-  const int kMmaTileSeqLenP,   // 4, more MMA(warp), M=16*4=64, P@V
-                                // =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-  const int kMmaTileHeadDimV,  // 1, more MMA(warp), N=8*1 =8,  P@V
-                                // =[Br(M),Bc(K)]@[Bc(K), d(N) ]
-  const int kWarpTileSeqLenQ,  // 1, more values, M, Br=64*1=64, matmul M
-  const int kWarpTileSeqLenK,  // 8, more values, N, Bc=8*8 =64, matmul N
-  const int kWarpTileSeqLenP,  // 1, more values, M, Br=64*1=64, matmul M
-  const int kWarpTileHeadDimV, // 8, more values, N,
-                                // d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
-  const int kOStorageAccFloat32, // 0/1, MMA Acc always be fp16, but O
-                                  // storage can be fp32 or half.
-  const int kStage,              // 1,2
-  const int kPadQ,               // Pad Q/K/V 0,8
+  const int kHeadDim,
+  const int kMmaAtomM,
+  const int kMmaAtomN,
+  const int kMmaAtomK,
+  const int kMmaTileSeqLenQ,
+  const int kMmaTileSeqLenK,
+  const int kMmaTileSeqLenP,
+  const int kMmaTileHeadDimV,
+  const int kWarpTileSeqLenQ,
+  const int kWarpTileSeqLenK,  // 8
+  const int kWarpTileSeqLenP,  // 1
+  const int kWarpTileHeadDimV,
+  const int kOStorageAccFloat32,
+  const int kStage,              // 1
+  const int kPadQ,               // 0,8,16
   const int kPadK, const int kPadV>
 __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
 omni_attn_swizzle_kernel(
@@ -159,7 +153,6 @@ omni_attn_swizzle_kernel(
   fill_3D_regs<uint32_t, kWarpTileSeqLenP, kWarpTileHeadDimV,((kOStorageAccFloat32) ? 4 : 2)>(R_D, 0);
 
   // load Q from gmem -> smem, only load once. use CP_ASYNC_CG with swizzling
-  // For flat layout with swizzling: apply swizzle within each kMmaAtomK chunk
   {
     int load_gmem_Q_d = load_smem_Q_d;
     int load_gmem_Q_addr = (Q_gmem_offset + load_gmem_Q_Br * kHeadDim + load_gmem_Q_d);
@@ -248,57 +241,63 @@ omni_attn_swizzle_kernel(
     // compute S = Q @ K^T with multiple MMA tiles(m16n8k16)
     fill_3D_regs<uint32_t, kWarpTileSeqLenQ, kWarpTileSeqLenK, 4>(R_S, 0);
     
-    #pragma unroll
-    for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
-      if (kv_idx == 0 && tile_K_d == 0 && lane_id < 1 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 0) {
-        int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + 0 * kMmaAtomM;
-        int actual_Q_row = Q_tile_id * Br + warp_smem_Q_Br + (lane_id % 16);
-      }
-      // load Q from smem to registers (m16k16) with swizzling
+    // NOTE: Using MMA path for all blocks (including CAUSAL/PARTIAL) for correctness and performance
+    // MMSF32 may introduce some precision loss, but replicating the exact MMA register layout
+    // for a non-MMA path is complex and error-prone. If precision is critical, consider
+    // using a different kernel or post-processing approach.
+    
+    // MMA path for all blocks
       #pragma unroll
-      for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
-        int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
-        int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-        int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
-        int d_chunk = lane_smem_Q_d / kMmaAtomK;
-        int d_offset = lane_smem_Q_d % kMmaAtomK;
-        int swizzled_offset = swizzle_permuted_Q_j<kMmaAtomK>(lane_smem_Q_Br, d_offset);
-        uint32_t lane_smem_Q_ptr = (smem_Q_base_ptr + 
-                                    (lane_smem_Q_Br * (kHeadDim + kPadQ) + 
-                                     d_chunk * kMmaAtomK + swizzled_offset) * sizeof(half));
-        LDMATRIX_X4(R_Q[0][i][0], R_Q[0][i][1], R_Q[0][i][2], R_Q[0][i][3], lane_smem_Q_ptr);
-      }
+      for (int tile_K_d = 0; tile_K_d < (kHeadDim / kMmaAtomK); ++tile_K_d) {
+        if (kv_idx == 0 && tile_K_d == 0 && lane_id < 1 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 0) {
+          int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + 0 * kMmaAtomM;
+          int actual_Q_row = Q_tile_id * Br + warp_smem_Q_Br + (lane_id % 16);
+        }
+        // load Q from smem to registers (m16k16) with swizzling
+        #pragma unroll
+        for (int i = 0; i < kWarpTileSeqLenQ; ++i) {
+          int warp_smem_Q_Br = warp_QP * (kMmaAtomM * kWarpTileSeqLenQ) + i * kMmaAtomM;
+          int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
+          int lane_smem_Q_d = tile_K_d * kMmaAtomK + (lane_id / 16) * 8;
+          int d_chunk = lane_smem_Q_d / kMmaAtomK;
+          int d_offset = lane_smem_Q_d % kMmaAtomK;
+          int swizzled_offset = swizzle_permuted_Q_j<kMmaAtomK>(lane_smem_Q_Br, d_offset);
+          uint32_t lane_smem_Q_ptr = (smem_Q_base_ptr + 
+                                      (lane_smem_Q_Br * (kHeadDim + kPadQ) + 
+                                       d_chunk * kMmaAtomK + swizzled_offset) * sizeof(half));
+          LDMATRIX_X4(R_Q[0][i][0], R_Q[0][i][1], R_Q[0][i][2], R_Q[0][i][3], lane_smem_Q_ptr);
+        }
 
-      // load K from smem to registers (k16n8) with swizzling
-      #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        int warp_smem_K_Bc = warp_KV * (kMmaAtomN * kWarpTileSeqLenK) + j * kMmaAtomN;
-        int lane_smem_K_Bc = warp_smem_K_Bc + lane_id % 8;
-        int lane_smem_K_d = tile_K_d * kMmaAtomK + ((lane_id / 8) % 2) * 8;
-        int d_chunk = lane_smem_K_d / kMmaAtomK;
-        int d_offset = lane_smem_K_d % kMmaAtomK;
-        int swizzled_offset = swizzle_permuted_K_j<kMmaAtomK>(lane_smem_K_Bc, d_offset);
-        uint32_t lane_smem_K_ptr = (smem_K_base_ptr + 
-                                    (lane_smem_K_Bc * (kHeadDim + kPadK) + 
-                                     d_chunk * kMmaAtomK + swizzled_offset) * sizeof(half));
-        LDMATRIX_X2(R_K[j][0], R_K[j][1], lane_smem_K_ptr);
-        
-        // DEBUG: Print K column indices
-        if (tile_K_d == 0 && j == 0 && lane_id < 1 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 0 && kv_idx == 0) {
-          int actual_K_col = kv_block * KV_BLOCK_SIZE + lane_smem_K_Bc;
+        // load K from smem to registers (k16n8) with swizzling
+        #pragma unroll
+        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+          int warp_smem_K_Bc = warp_KV * (kMmaAtomN * kWarpTileSeqLenK) + j * kMmaAtomN;
+          int lane_smem_K_Bc = warp_smem_K_Bc + lane_id % 8;
+          int lane_smem_K_d = tile_K_d * kMmaAtomK + ((lane_id / 8) % 2) * 8;
+          int d_chunk = lane_smem_K_d / kMmaAtomK;
+          int d_offset = lane_smem_K_d % kMmaAtomK;
+          int swizzled_offset = swizzle_permuted_K_j<kMmaAtomK>(lane_smem_K_Bc, d_offset);
+          uint32_t lane_smem_K_ptr = (smem_K_base_ptr + 
+                                      (lane_smem_K_Bc * (kHeadDim + kPadK) + 
+                                       d_chunk * kMmaAtomK + swizzled_offset) * sizeof(half));
+          LDMATRIX_X2(R_K[j][0], R_K[j][1], lane_smem_K_ptr);
+          
+          // DEBUG: Print K column indices
+          if (tile_K_d == 0 && j == 0 && lane_id < 1 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 0 && kv_idx == 0) {
+            int actual_K_col = kv_block * KV_BLOCK_SIZE + lane_smem_K_Bc;
+          }
+        }
+
+        // MMA computation: R_S += R_Q @ R_K^T (m16n8k16)
+        // MMA always accumulate with F32 dtype for high precision.
+        #pragma unroll
+        for (int j = 0; j < kWarpTileSeqLenK; ++j) {
+          HMMA16816F32(R_S[0][j][0], R_S[0][j][1], R_S[0][j][2], R_S[0][j][3],
+                       R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3],
+                       R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1],
+                       R_S[0][j][2], R_S[0][j][3]);
         }
       }
-
-      // MMA computation: R_S += R_Q @ R_K^T (m16n8k16)
-      // MMA always accumulate with F32 dtype for high precision.
-      #pragma unroll
-      for (int j = 0; j < kWarpTileSeqLenK; ++j) {
-        HMMA16816F32(R_S[0][j][0], R_S[0][j][1], R_S[0][j][2], R_S[0][j][3],
-                     R_Q[0][0][0], R_Q[0][0][1], R_Q[0][0][2], R_Q[0][0][3],
-                     R_K[j][0], R_K[j][1], R_S[0][j][0], R_S[0][j][1],
-                     R_S[0][j][2], R_S[0][j][3]);
-      }
-    }
     __syncthreads();
 
     // apply scale before mask, scores = (Q @ K^T) / sqrt(d)
@@ -316,11 +315,6 @@ omni_attn_swizzle_kernel(
     int q_block_start = q_block * Q_BLOCK_SIZE;  // Same as Q_tile_id * Br when Br == Q_BLOCK_SIZE
     int kv_base = kv_block * KV_BLOCK_SIZE;
     
-    // DEBUG: Print mask type to verify all types are being processed
-    // if (lane_id % 16 == 0 && QKV_batch_id == 0 && QKV_head_id == 0 && q_block == 1 && kv_idx == 1) {
-    //   printf("[DEBUG MASK_TYPE] lane_id=%d kv_block=%d mask_type=%d (0=MASKED,1=CAUSAL,2=FULL,3=PARTIAL)\n",
-    //          lane_id, kv_block, mask_type);
-    // }
     
     if (mask_type == BLOCK_MASK_CAUSAL) {
       int row_in_warp = lane_id % 16;
@@ -358,8 +352,8 @@ omni_attn_swizzle_kernel(
       // Rows 0-7: S[0], S[1] are for columns col_pair and col_pair
       // Rows 8-15: S[2], S[3] are for columns col_pair and col_pair+1
       int row_in_warp = lane_id % 16;
-      int row_in_tile = lane_id % 8;  // 0-7 for rows within the 8-row group
-      int col_pair = (lane_id / 8) * 2;  // 0, 2, 4, 6 - first column of the pair
+      int row_in_tile = lane_id % 8;
+      int col_pair = (lane_id / 8) * 2;
       const int block_area = Q_BLOCK_SIZE * KV_BLOCK_SIZE;
       
       #pragma unroll
@@ -831,6 +825,12 @@ void omni_attn_mma_stages_split_q_shared_kv_swizzle(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                               kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                               kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                               kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -856,6 +856,12 @@ void omni_attn_mma_stages_split_q_shared_kv_swizzle(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                               kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                               kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                               kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -881,6 +887,12 @@ void omni_attn_mma_stages_split_q_shared_kv_swizzle(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                               kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                               kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                               kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -922,6 +934,12 @@ void omni_attn_mma_stages_split_q_shared_kv_swizzle(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                               kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                               kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                               kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -947,6 +965,12 @@ void omni_attn_mma_stages_split_q_shared_kv_swizzle(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                               kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                               kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                               kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -972,6 +996,12 @@ void omni_attn_mma_stages_split_q_shared_kv_swizzle(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                               kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                               kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                               kOStorageAccFloat32, kStage, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_swizzle_kernel<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,

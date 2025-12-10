@@ -732,6 +732,12 @@ void omni_attn_preftech_kernel(
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       // Double-buffering: need separate K and V buffers
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                          kOStorageAccFloat32, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -756,6 +762,12 @@ void omni_attn_preftech_kernel(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                          kOStorageAccFloat32, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -780,6 +792,12 @@ void omni_attn_preftech_kernel(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                          kOStorageAccFloat32, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -819,6 +837,12 @@ void omni_attn_preftech_kernel(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                          kOStorageAccFloat32, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -843,6 +867,12 @@ void omni_attn_preftech_kernel(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                          kOStorageAccFloat32, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
@@ -867,6 +897,12 @@ void omni_attn_preftech_kernel(
       constexpr int K_tile_size = Bc * (kHeadDim + kPadK);
       constexpr int V_tile_size = Bc * (kHeadDim + kPadV);
       constexpr int smem_size = (Q_tile_size + K_tile_size + V_tile_size) * sizeof(half);
+      set_kernel_max_dynamic_smem(reinterpret_cast<const void *>(
+                                      omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
+                                                          kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
+                                                          kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
+                                                          kOStorageAccFloat32, kPadQ, kPadK, kPadV>),
+                                  smem_size);
       omni_attn_prefetch<kHeadDim, kMmaAtomM, kMmaAtomN, kMmaAtomK,
           kMmaTileSeqLenQ, kMmaTileSeqLenK, kMmaTileSeqLenP, kMmaTileHeadDimV,
           kWarpTileSeqLenQ, kWarpTileSeqLenK, kWarpTileSeqLenP, kWarpTileHeadDimV,
