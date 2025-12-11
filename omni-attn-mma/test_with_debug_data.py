@@ -358,22 +358,16 @@ def test_with_debug_data(debug_data_file="debug_data.pt", device="cuda"):
     def format_tflops(val):
         return f", TFLOPS: {val:.2f}" if val is not None else ""
 
-    if flex_time is not None:
-        simple_speedup = flex_time / simple_time
-        prefetch_speedup = flex_time / preftech_time
-        shared_kv_speedup = flex_time / shared_kv_time
-        swizzle_speedup = flex_time / swizzle_time
-        print(f"  Simple {'PASSED✅' if simple_passed else 'FAILED❌'}, time: {simple_time*1000:.2f}ms{format_tflops(simple_tflops)}, speedup: {simple_speedup:.2f}x")
-        print(f"  Prefetch {'PASSED✅' if prefetch_passed else 'FAILED❌'}, time: {preftech_time*1000:.2f}ms{format_tflops(preftech_tflops)}, speedup: {prefetch_speedup:.2f}x")
-        print(f"  Shared_kv {'PASSED✅' if shared_kv_passed else 'FAILED❌'}, time: {shared_kv_time*1000:.2f}ms{format_tflops(shared_kv_tflops)}, speedup: {shared_kv_speedup:.2f}x")
-        print(f"  Swizzle {'PASSED✅' if swizzle_passed else 'FAILED❌'}, time: {swizzle_time*1000:.2f}ms{format_tflops(swizzle_tflops)}, speedup: {swizzle_speedup:.2f}x")
-        print(f"  Flex {'PASSED✅' if flex_passed else 'FAILED❌'}, time: {flex_time*1000:.2f}ms{format_tflops(flex_tflops)}")
-    else:
-        print(f"  Simple {'PASSED✅' if simple_passed else 'FAILED❌'}, time: {simple_time*1000:.2f}ms{format_tflops(simple_tflops)}")
-        print(f"  Prefetch {'PASSED✅' if prefetch_passed else 'FAILED❌'}, time: {preftech_time*1000:.2f}ms{format_tflops(preftech_tflops)}")
-        print(f"  Shared_kv {'PASSED✅' if shared_kv_passed else 'FAILED❌'}, time: {shared_kv_time*1000:.2f}ms{format_tflops(shared_kv_tflops)}")
-        print(f"  Swizzle {'PASSED✅' if swizzle_passed else 'FAILED❌'}, time: {swizzle_time*1000:.2f}ms{format_tflops(swizzle_tflops)}")
-        print(f"  Flex: Skipped")
+    simple_speedup = flex_time / simple_time
+    prefetch_speedup = flex_time / preftech_time
+    shared_kv_speedup = flex_time / shared_kv_time
+    swizzle_speedup = flex_time / swizzle_time
+    print(f"  Simple: time: {simple_time*1000:.2f}ms{format_tflops(simple_tflops)}, speedup: {simple_speedup:.2f}x")
+    print(f"  Prefetch: time: {preftech_time*1000:.2f}ms{format_tflops(preftech_tflops)}, speedup: {prefetch_speedup:.2f}x")
+    print(f"  Shared_kv: time: {shared_kv_time*1000:.2f}ms{format_tflops(shared_kv_tflops)}, speedup: {shared_kv_speedup:.2f}x")
+    print(f"  Swizzle: time: {swizzle_time*1000:.2f}ms{format_tflops(swizzle_tflops)}, speedup: {swizzle_speedup:.2f}x")
+    print(f"  FlexAttention: time: {flex_time*1000:.2f}ms{format_tflops(flex_tflops)}")
+
         
 if __name__ == "__main__":
     import argparse
